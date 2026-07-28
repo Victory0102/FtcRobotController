@@ -21,8 +21,23 @@ android {
     packagingOptions {
         jniLibs.useLegacyPackaging true
     }
+
+    // Bundled Run Health UI assets are shipped under src/main/assets/runhealth/
+    // and copied into the APK and made available to the Robot Controller web
+    // server at /runhealth/assets/*
+    sourceSets {
+        main {
+            assets.srcDirs += file('src/main/assets/runhealth')
+        }
+    }
 }
 
 dependencies {
     implementation project(':FtcRobotController')
+
+    // JUnit testing of FTC Run Health pure logic.  The FTC SDK is part of the
+    // implementation classpath, but unit tests can be run on JVM only for the
+    // pure helpers (RunHealthCsv, RunId, FilenameSanitizer, RunHealthApi) by
+    // stubbing out Android dependencies.
+    testImplementation 'junit:junit:4.13.2'
 }

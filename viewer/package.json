@@ -1,0 +1,19 @@
+{
+  "name": "ftc-run-health-viewer",
+  "version": "1.0.0",
+  "description": "Run Health Browser Viewer (TypeScript)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node ./scripts/copy-assets.mjs",
+    "copy-assets": "node ./scripts/copy-assets.mjs",
+    "test": "vitest run --reporter=default",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

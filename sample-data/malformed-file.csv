@@ -1,0 +1,5 @@
+schema_version,run_id,opmode_name,run_started_at,timestamp_ms,device_name,commanded_power,encoder_position_ticks,encoder_velocity_ticks_per_second,current_amps,motor_mode,battery_voltage
+unbalanced quote " and a comma,here
+,,,,,,,,,
+[object Object],,,,,,,,
+1,00000000-aaaa-0000-0000-000000000020,Bad,2025-03-15T10:00:00Z,0,leftFront,0.5,0,2000,1.5,RUN_USING_ENCODER,12.4
