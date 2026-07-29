@@ -104,3 +104,15 @@ Every logger and API entry point is defensively coded:
 
 See `SECURITY.md`, `LIMITATIONS.md`, and `CONTROL_HUB_TEST_PLAN.md` for
 additional guarantees and known gaps.
+
+## Live telemetry
+
+The Live tab is a read-only browser dashboard over the bounded
+`LiveSnapshotRegistry`.  `RunHealthSession.capture()` publishes the
+latest immutable `LiveSnapshot` (one reachable object, never a
+queue) under the session lock.  `finish()` calls
+`LiveSnapshotRegistry.markInactive()` so the browser sees
+`active=false` while preserving the last field values.  The
+`GET /runhealth/api/live/snapshot` endpoint is GET-only by
+construction; see `LIVE_VIEW.md` for the schema, polling cadence,
+and bounded browser buffers.

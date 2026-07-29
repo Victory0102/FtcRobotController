@@ -93,12 +93,36 @@ public final class RunHealthSession implements AutoCloseable {
     private volatile boolean finished = false;
     /** True once we have consumed the persisted NEXT claim. */
     private volatile boolean consumedNext = false;
+    /** True if the channel buffer dropped data due to cap (separate from motor cap). */
+    private volatile boolean truncatedChannels = false;
     /**
      * Set to true after the very first successful capture. If the OpMode is
      * initialized and canceled before this happens, the claim is held and
      * {@link #finish()} will release it so a subsequent OpMode can claim.
      */
     private volatile boolean armedAndUnconsumed = false;
+
+    /* ---------------- v2 custom-channel buffers ----------------
+     *
+     * The session also accepts typed custom telemetry via
+     *   put(name, double), putBoolean, putText, putPose, mark(String)
+     * and channel declarations via defineChannel(spec).
+     *
+     * Two-tier buffering pattern:
+     *   - latestValuesByName: the most-recent staged value for each channel.
+     *     put() overwrites here.  capture() flushes these into committedSamples.
+     *   - committedSamples: the durable record that finish() will serialise
+     *     to channels.csv.  Includes every channel sample and every mark().
+     *
+     * Event markers (mark()) bypass the rate limit by writing directly into
+     * committedSamples so a user-triggered event is preserved with the
+     * exact tap-time timestamp.
+     */
+    private final java.util.Map<String, ChannelSample> latestValuesByName = new java.util.HashMap<>();
+    private final java.util.List<ChannelSample> committedSamples = new java.util.ArrayList<>();
+    private final ChannelRegistry channelRegistry = new ChannelRegistry();
+    private int channelSamplesCap = 5400;
+    private boolean channelsFlushedAtLeastOnce = false;
 
     private RunHealthSession(HardwareMap hardwareMap,
                              Object opmodeContextOrName,
@@ -278,6 +302,36 @@ public final class RunHealthSession implements AutoCloseable {
                     truncated = true;
                     RobotLog.ww(TAG, "Sample cap reached; subsequent captures will be skipped");
                 }
+
+                // Flush staged custom-channel values into the durable record.
+                // Done under the same lock+throttle cadence so channels share
+                // the documented 10 Hz cap; mark() bypasses this and writes
+                // immediately.
+                if (!latestValuesByName.isEmpty()) {
+                    java.util.Iterator<java.util.Map.Entry<String, ChannelSample>> it =
+                            latestValuesByName.entrySet().iterator();
+                    while (it.hasNext()) {
+                        java.util.Map.Entry<String, ChannelSample> e = it.next();
+                        if (committedSamples.size() >= channelSamplesCap) {
+                            truncated = true;
+                            truncatedChannels = true;
+                            break;
+                        }
+                        committedSamples.add(e.getValue());
+                        it.remove();
+                    }
+                    if (!committedSamples.isEmpty()) channelsFlushedAtLeastOnce = true;
+                }
+                // Publish the latest bounded live snapshot.  This is O(1)
+                // for the reader (volatile assignment of an immutable
+                // POJO) and never throws even under pathological input —
+                // the read-only API endpoint simply returns the previous
+                // snapshot if this publish fails.
+                try {
+                    publishLiveSnapshot();
+                } catch (Throwable tIgnored) {
+                    RobotLog.vv(TAG, "live publish skipped: " + tIgnored.getMessage());
+                }
                 return true;
             }
         } catch (Throwable t) {
@@ -299,6 +353,16 @@ public final class RunHealthSession implements AutoCloseable {
             if (finished) return;
             finished = true;
 
+            // Mark the live snapshot inactive so the browser sees the
+            // session as "finished" without affecting the durable recording
+            // or the recording-mode flag.  Wrapped to never throw — the
+            // OpMode has already written or skipped its CSV; this is purely
+            // a display signal.
+            try {
+                org.firstinspires.ftc.teamcode.runhealth.logging.LiveSnapshotRegistry
+                        .getInstance().markInactive();
+            } catch (Throwable tIgnored) { /* swallow */ }
+
             // If the OpMode never produced its first sample, release the NEXT
             // claim so the next call may still claim it.
             if (armedAndUnconsumed) {
@@ -311,37 +375,127 @@ public final class RunHealthSession implements AutoCloseable {
                 return;
             }
             int total = totalSamples();
-            if (total == 0) {
+            if (total == 0 && committedSamples.isEmpty()) {
                 RobotLog.ii(TAG, "No samples captured; no file written for opmode=" + opmodeName);
                 return;
             }
 
+            String utcTs = runStartedAt;            // ISO-8601 already
+            String safeTs = utcTs.replace(':', '-');
+            String opSeg = truncated
+                    ? org.firstinspires.ftc.teamcode.runhealth.logging.FilenameSanitizer
+                            .sanitizeSegment(opmodeName) + "-truncated"
+                    : org.firstinspires.ftc.teamcode.runhealth.logging.FilenameSanitizer
+                            .sanitizeSegment(opmodeName);
+            long durationMs = runClock != null ? (long) runClock.milliseconds() : 0L;
+
             try {
-                StringBuilder sb = new StringBuilder(64 + total * 64);
-                sb.append(RunHealthCsv.headerRow()).append('\n');
-                for (MotorSample row : snapshotBuffer()) {
-                    sb.append(row.toCsvRow()).append('\n');
+                if (total == 0) {
+                    // Channel-only run: we deliberately do NOT write an empty
+                    // v1 motor CSV (v1 parsers treat header-only as No-samples
+                    // error).  The run is discoverable through its manifest
+                    // and channels companion files instead.
+                    RobotLog.ii(TAG, "Channel-only run; skipping motor CSV for opmode=" + opmodeName
+                            + " channels=" + committedSamples.size());
+                } else {
+                    StringBuilder sb = new StringBuilder(64 + total * 64);
+                    sb.append(RunHealthCsv.headerRow()).append('\n');
+                    for (MotorSample row : snapshotBuffer()) {
+                        sb.append(row.toCsvRow()).append('\n');
+                    }
+                    // Append a metadata footer line: still within the schema,
+                    // with all numeric fields blank and run_id == our id, so
+                    // the parser's strict column validator can still recognise it.
+                    if (truncated) {
+                        sb.append(truncatedMarkerRow()).append('\n');
+                    }
+                    java.io.File out = storage.writeRun(safeTs, opSeg, runId, sb.toString());
+                    RobotLog.ii(TAG, "Run written: " + out.getAbsolutePath()
+                            + " samples=" + total
+                            + " truncated=" + truncated);
                 }
-                // Append a metadata footer line: still within the schema,
-                // with all numeric fields blank and run_id == our id, so
-                // the parser's strict column validator can still recognise it.
-                if (truncated) {
-                    sb.append(truncatedMarkerRow()).append('\n');
+
+                // ---------------- v2 companion files -----------------
+                if (!committedSamples.isEmpty()) {
+                    StringBuilder cb = new StringBuilder(64 + committedSamples.size() * 96);
+                    cb.append(ChannelsCsv.headerRow()).append('\n');
+                    // Sorted by (timestamp_ms, channel_name) for stable diffs in tests.
+                    java.util.List<ChannelSample> sorted = new java.util.ArrayList<>(committedSamples);
+                    sorted.sort((a, b) -> {
+                        int c = Long.compare(a.timestampMs, b.timestampMs);
+                        if (c != 0) return c;
+                        return a.channelName.compareTo(b.channelName);
+                    });
+                    for (ChannelSample s : sorted) {
+                        cb.append(s.toCsvRow()).append('\n');
+                    }
+                    String stem = FilenameSanitizer.buildCsvFilename(safeTs, opSeg, runId);
+                    String motorsStem = stem;
+                    String channelsStem = stem.substring(0, stem.length() - 4) + ".channels.csv";
+                    java.io.File chOut = storage.writeCompanion(channelsStem, cb.toString());
+                    RobotLog.ii(TAG, "Channels written: " + chOut.getAbsolutePath()
+                            + " samples=" + committedSamples.size());
+
+                    // Build the manifest
+                    java.util.List<String> deviceNames = deviceNamesSnapshot();
+                    String buildId = System.getProperty("runhealth.build_id", "");
+                    RunManifest.Builder mb = RunManifest.builder()
+                            .runId(runId)
+                            .opmodeName(opmodeName)
+                            .runStartedAt(runStartedAt)
+                            .durationMs(durationMs)
+                            .buildIdentifier(buildId)
+                            .configFingerprint(fingerprintOf(deviceNames))
+                            .deviceNames(deviceNames)
+                            .truncated(truncated)
+                            .motorsFile(motorsStem)
+                            .channelsFile(channelsStem);
+                    for (ChannelSpec spec : channelRegistry.snapshot()) {
+                        mb.addChannel(spec);
+                    }
+                    RunManifest mf = mb.build();
+                    String manifestStem = stem.substring(0, stem.length() - 4) + ".manifest.json";
+                    java.io.File mfOut = storage.writeCompanion(manifestStem, mf.toJson());
+                    RobotLog.ii(TAG, "Manifest written: " + mfOut.getAbsolutePath());
                 }
-                String utcTs = runStartedAt;           // ISO-8601 already
-                String safeTs = utcTs.replace(':', '-');
-                String opSeg = truncated
-                        ? org.firstinspires.ftc.teamcode.runhealth.logging.FilenameSanitizer
-                                .sanitizeSegment(opmodeName) + "-truncated"
-                        : org.firstinspires.ftc.teamcode.runhealth.logging.FilenameSanitizer
-                                .sanitizeSegment(opmodeName);
-                java.io.File out = storage.writeRun(safeTs, opSeg, runId, sb.toString());
-                RobotLog.ii(TAG, "Run written: " + out.getAbsolutePath()
-                        + " samples=" + total
-                        + " truncated=" + truncated);
             } catch (Throwable t) {
                 RobotLog.ee(TAG, t, "Failed to persist Run Health CSV");
             }
+        }
+    }
+
+    private java.util.List<String> deviceNamesSnapshot() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            for (DcMotorEx m : motors) {
+                String name = providedNames.get(m);
+                if (name == null || name.isEmpty()) continue;
+                if (!out.contains(name)) out.add(name);
+            }
+        } catch (Throwable t) { /* swallow */ }
+        java.util.Collections.sort(out);
+        return out;
+    }
+
+    /** Stable, low-cost fingerprint over sorted device names. */
+    private static String fingerprintOf(java.util.List<String> deviceNames) {
+        if (deviceNames == null || deviceNames.isEmpty()) return "empty";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < deviceNames.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(deviceNames.get(i));
+        }
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                hex.append(String.format(java.util.Locale.US, "%02x", b & 0xff));
+            }
+            return hex.toString();
+        } catch (Throwable t) {
+            // SHA-256 always present on Android API 24+, but defensive.
+            return Integer.toHexString(sb.toString().hashCode());
         }
     }
 
@@ -388,6 +542,291 @@ public final class RunHealthSession implements AutoCloseable {
     /** True if the run was truncated due to the per-motor sample cap. */
     public boolean wasTruncated() {
         return truncated;
+    }
+
+    // -------------------------------------------------------------- live snapshot
+
+    /**
+     * Builds and publishes a {@link LiveSnapshot} representing the most
+     * recent sampled state.  Called from {@link #capture()} inside the
+     * session lock so readers cannot observe a half-stage state.  Never
+     * throws to the caller; all failures are swallowed and logged.
+     */
+    private void publishLiveSnapshot() {
+        if (hardwareMap == null) return; // no-op session: do not pollute the registry
+        LiveSnapshotRegistry reg = LiveSnapshotRegistry.getInstance();
+        long now = (long) (runClock != null ? runClock.milliseconds() : 0L);
+        LiveSnapshot.Factory f = new LiveSnapshot.Factory();
+        f.active(true)
+                .sessionId(runId)
+                .opMode(opmodeName)
+                .recordingMode(org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.getRecordingMode())
+                .sequence(reg.currentSequence() + 1L)
+                .timestampMs(System.currentTimeMillis())
+                .elapsedMs(now);
+
+        // Battery voltage — read this tick via BatteryVoltageReader.
+        Double battV = null;
+        try { battV = BatteryVoltageReader.read(hardwareMap); } catch (Throwable ignored) { battV = null; }
+        if (battV != null && Double.isFinite(battV)) f.batteryVoltage(battV);
+        else f.batteryVoltage(null);
+
+        // Motors — read once per motor, emit a MotorView with nulls for
+        // fields the SDK did not expose.  Never coercive: if a motor is
+        // disconnected, the corresponding MotorView fields are null.
+        for (int i = 0; i < motors.size(); i++) {
+            DcMotorEx m = motors.get(i);
+            String name = providedNames.get(m);
+            if (name == null || name.isEmpty()) name = "unknown";
+            Double power = null;
+            Long position = null;
+            Double velocity = null;
+            Double amps = null;
+            String mode = null;
+            try {
+                double p = m.getPower();
+                if (Double.isFinite(p)) power = p;
+            } catch (Throwable ignored) { /* null */ }
+            try {
+                int p = m.getCurrentPosition();
+                position = (long) p;
+            } catch (Throwable ignored) { /* null */ }
+            try {
+                double v = m.getVelocity();
+                if (Double.isFinite(v)) velocity = v;
+            } catch (Throwable ignored) { /* null */ }
+            try {
+                // Use the reflection-based helper so we compile against SDK
+                // builds that may not expose the modern CurrentUnit class.
+                Double a = readMotorCurrentAmps(m);
+                if (a != null && Double.isFinite(a)) amps = a;
+            } catch (Throwable ignored) { /* null */ }
+            try {
+                com.qualcomm.robotcore.hardware.DcMotor.RunMode mm = m.getMode();
+                if (mm != null) mode = mm.toString();
+            } catch (Throwable ignored) { /* null */ }
+            f.addMotor(new LiveSnapshot.MotorView(name, power, position, velocity, amps, mode));
+        }
+
+        // Channels — emit the latest staged value per channel name so the
+        // browser sees numbers / booleans / text / pose in one snapshot.
+        try {
+            for (java.util.Map.Entry<String, ChannelSample> e : latestValuesByName.entrySet()) {
+                ChannelSample s = e.getValue();
+                String kindStr;
+                switch (s.type) {
+                    case NUMBER: kindStr = "number"; break;
+                    case BOOLEAN: kindStr = "boolean"; break;
+                    case TEXT: kindStr = "text"; break;
+                    case POSE: kindStr = "pose"; break;
+                    case EVENT: kindStr = "event"; break;
+                    default: kindStr = "number";
+                }
+                ChannelSpec spec = channelRegistry.get(e.getKey());
+                String unit = spec == null ? null : spec.unit;
+                String group = spec == null ? null : spec.group;
+                String desc = spec == null ? null : spec.description;
+                f.addChannel(new LiveSnapshot.ChannelView(
+                        s.channelName, kindStr,
+                        s.valueNumber, s.valueBoolean, s.valueText,
+                        s.valueX, s.valueY, s.valueHeading,
+                        unit, group, desc));
+            }
+        } catch (Throwable ignored) { /* swallow */ }
+
+        // Surface up to 4 most-recent event markers (committedSamples
+        // whose kind is EVENT) so the browser can render them on graphs
+        // and the field timeline.  Bounded count keeps the snapshot small.
+        try {
+            int n = committedSamples.size();
+            int from = Math.max(0, n - 4);
+            for (int i = from; i < n; i++) {
+                ChannelSample s = committedSamples.get(i);
+                if (s == null || s.type != ChannelType.EVENT) continue;
+                String label = s.valueText != null ? s.valueText : "";
+                if (label.isEmpty() && s.note != null) label = s.note;
+                f.addEvent(new LiveSnapshot.EventView(s.timestampMs, label));
+            }
+        } catch (Throwable ignored) { /* swallow */ }
+
+        reg.publish(f.build());
+    }
+
+    // -------------------------------------------------------------- v2 API
+
+    /**
+     * Declares a custom channel and its metadata.  Idempotent: redeclaring a
+     * channel with the same name and {@link ChannelType} refines the
+     * metadata in place if it was empty before; divergent declarations
+     * (same name, different type) are rejected silently.
+     *
+     * <p>Defining a channel is optional.  Teams that call {@link #put} or
+     * {@link #mark} without first calling {@code defineChannel} still get
+     * their samples recorded — the channel appears with default metadata
+     * ("unknown" group, no unit, no description).
+     *
+     * @return {@code true} when the registration succeeded; {@code false}
+     *         on validation failure, channel cap, or conflicting redefinition.
+     */
+    public boolean defineChannel(ChannelSpec spec) {
+        if (hardwareMap == null) return false;
+        if (spec == null) return false;
+        try {
+            return channelRegistry.define(spec);
+        } catch (Throwable t) {
+            RobotLog.ww(TAG, "defineChannel rejected: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** Numeric channel.  Overwrites any prior staged value with the same name. */
+    public void put(String name, double value) {
+        if (hardwareMap == null) return;
+        if (name == null) return;
+        try {
+            String key = ChannelSpec.validateName(name.trim());
+            if (!Double.isFinite(value)) return;
+            double nowMs = runClock != null ? (long) runClock.milliseconds() : 0L;
+            ChannelSample sample = new ChannelSample(
+                    (long) nowMs, key, ChannelType.NUMBER,
+                    Double.valueOf(value), null, null,
+                    null, null, null, null);
+            synchronized (lock) {
+                latestValuesByName.put(ChannelSpec.keyFor(key), sample);
+            }
+        } catch (Throwable t) {
+            RobotLog.vv(TAG, "put " + name + " rejected: " + t.getMessage());
+        }
+    }
+
+    /** Boolean channel.  Overwrites the previous staged value. */
+    public void putBoolean(String name, boolean value) {
+        if (hardwareMap == null) return;
+        if (name == null) return;
+        try {
+            String key = ChannelSpec.validateName(name.trim());
+            double nowMs = runClock != null ? (long) runClock.milliseconds() : 0L;
+            ChannelSample sample = new ChannelSample(
+                    (long) nowMs, key, ChannelType.BOOLEAN,
+                    null, Boolean.valueOf(value), null,
+                    null, null, null, null);
+            synchronized (lock) {
+                latestValuesByName.put(ChannelSpec.keyFor(key), sample);
+            }
+        } catch (Throwable t) {
+            RobotLog.vv(TAG, "putBoolean " + name + " rejected: " + t.getMessage());
+        }
+    }
+
+    /** Text channel.  Strings longer than {@link ChannelsCsv#MAX_TEXT_VALUE}
+     *  are truncated.  Overwrites the previous staged value. */
+    public void putText(String name, String value) {
+        if (hardwareMap == null) return;
+        if (name == null) return;
+        try {
+            String key = ChannelSpec.validateName(name.trim());
+            double nowMs = runClock != null ? (long) runClock.milliseconds() : 0L;
+            ChannelSample sample = new ChannelSample(
+                    (long) nowMs, key, ChannelType.TEXT,
+                    null, null, clamp(value, ChannelsCsv.MAX_TEXT_VALUE),
+                    null, null, null, null);
+            synchronized (lock) {
+                latestValuesByName.put(ChannelSpec.keyFor(key), sample);
+            }
+        } catch (Throwable t) {
+            RobotLog.vv(TAG, "putText " + name + " rejected: " + t.getMessage());
+        }
+    }
+
+    /** Robot pose channel.  Each coordinate must be finite; non-finite values
+     *  are dropped silently, leaving the previous valid pose in place. */
+    public void putPose(String name, double x, double y, double headingRadians) {
+        if (hardwareMap == null) return;
+        if (name == null) return;
+        try {
+            String key = ChannelSpec.validateName(name.trim());
+            if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(headingRadians)) {
+                return;
+            }
+            double nowMs = runClock != null ? (long) runClock.milliseconds() : 0L;
+            ChannelSample sample = new ChannelSample(
+                    (long) nowMs, key, ChannelType.POSE,
+                    null, null, null,
+                    Double.valueOf(x), Double.valueOf(y),
+                    Double.valueOf(headingRadians), null);
+            synchronized (lock) {
+                latestValuesByName.put(ChannelSpec.keyFor(key), sample);
+            }
+        } catch (Throwable t) {
+            RobotLog.vv(TAG, "putPose " + name + " rejected: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Records a single event marker.  Unlike {@link #put}, this writes
+     * immediately to the durable channel buffer, bypassing the
+     * 10 Hz throttle - so a user-noted event lands in the run with the
+     * timestamp at the moment the user called {@code mark(...)}.
+     *
+     * <p>A blank note is still recorded (the timestamp alone is useful
+     * for replay-synchronisation purposes).  The browser-side UI may
+     * render blank notes as a neutral marker.
+     *
+     * <p>The writer (ChannelsCsv.sampleRow) canonicalises every EVENT row
+     * to {@link ChannelsCsv#EVENT_CHANNEL_NAME} regardless of the channel
+     * name passed in here, so this method is free to pass any non-empty
+     * marker name and the wire contract remains stable.
+     *
+     * <p>The in-memory ChannelSample carries the placeholder name passed
+     * by {@code mark()}; the canonical {@code __event__} wire name is
+     * computed by ChannelsCsv.sampleRow at write time.  Introspection
+     * sites that inspect ChannelSample before CSV serialisation will see
+     * the placeholder, not the canonical wire name.
+     */
+    public void mark(String note) {
+        if (hardwareMap == null) return;
+        try {
+            double nowMs = runClock != null ? (long) runClock.milliseconds() : 0L;
+            String clamped = clamp(note, ChannelsCsv.MAX_NOTE_VALUE);
+            ChannelSample sample = new ChannelSample(
+                    (long) nowMs, "event", ChannelType.EVENT,
+                    null, null, clamped,
+                    null, null, null, clamped);
+            synchronized (lock) {
+                if (committedSamples.size() < channelSamplesCap) {
+                    committedSamples.add(sample);
+                    channelsFlushedAtLeastOnce = true;
+                } else {
+                    truncated = true;
+                    truncatedChannels = true;
+                }
+            }
+        } catch (Throwable t) {
+            RobotLog.vv(TAG, "mark rejected: " + t.getMessage());
+        }
+    }
+
+    /** True if any custom-channel sample was committed in this session. */
+    public boolean hasChannels() {
+        if (hardwareMap == null) return false;
+        synchronized (lock) {
+            return channelsFlushedAtLeastOnce || !committedSamples.isEmpty()
+                    || !latestValuesByName.isEmpty();
+        }
+    }
+
+    /** Returns a snapshot of the currently registered channel definitions.
+     *  The order is preserved: insertion order from the first
+     *  {@link #defineChannel} call. */
+    public java.util.List<ChannelSpec> definedChannels() {
+        if (hardwareMap == null) return java.util.Collections.emptyList();
+        return channelRegistry.snapshot();
+    }
+
+    private static String clamp(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, max);
     }
 
     // -------------------------------------------------------------- internals

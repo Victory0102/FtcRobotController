@@ -61,6 +61,45 @@ Configuration in the Driver Station accordingly.
 | 40 | Route-conflict behavior | Register a conflicting route at startup manually via SDK Sample; log shows Run Health routes skip the conflicting one but continue. |
 | 41 | File-isolation verification | Listing `/FIRST/blocks/` and `/FIRST/opmodes/` shows no Run Health files; only `/FIRST/RunHealth/runs/`. |
 
+## Desk-verification status (auto-verifiable without a robot)
+
+The following tests are verified by the JVM test suite under
+`TeamCode/src/test/java/.../runhealth/`, by the viewer Vitest suite,
+and by a clean `./gradlew.bat :TeamCode:assembleDebug --no-build-cache
+--no-daemon` run.  They do **not** require a Control Hub and a
+reference robot; they confirm the production wiring is intact.  The
+list below covers **only the tests for which a JVM or Vitest test
+already exists** — other tests (14, 16, partial 27) have JVM-testable
+production surface but the JVM test has not been authored yet, so
+they remain in the hardware-only column.
+
+| # | Verifiable on the desk | Verification surface |
+|---|--------------------------|----------------------|
+| 1 | Install APK succeeds | `./gradlew.bat :TeamCode:assembleDebug --no-build-cache --no-daemon` produces `TeamCode/build/outputs/apk/debug/TeamCode-debug.apk` (~51 MB). |
+| 17 | Download one run | `TeamCode/src/test/java/org/firstinspires/ftc/teamcode/runhealth/api/EndToEndApiSmokeTest.java` — POSTs a run then GETs `/api/runs/{id}/download` and parses `text/csv` content. |
+| 19 | Delete one run | `TeamCode/src/test/java/org/firstinspires/ftc/teamcode/runhealth/api/EndToEndApiSmokeTest.java` — issues DELETE and verifies the file is gone from the storage directory. |
+| 21 | Baseline selection | `TeamCode/src/test/java/org/firstinspires/ftc/teamcode/runhealth/api/EndToEndApiSmokeTest.java` — sets a baseline run id and verifies the read-back via the API. |
+| 22 | Baseline deletion auto-clears | `TeamCode/src/test/java/org/firstinspires/ftc/teamcode/runhealth/api/EndToEndApiSmokeTest.java` — deletes the baseline run then verifies the persisted baseline is `null`. |
+| 33 | CSV correctness | `viewer/tests/parser.test.ts`, `viewer/tests/metrics.test.ts`, `viewer/tests/comparison.test.ts` — Vitest runner via `npm test` in `viewer/`. |
+| 34 | Standalone viewer | `npm run build` in `viewer/` lands the bundle at `TeamCode/src/main/assets/runhealth/assets/main.js` and `viewer/dist/main.js`. |
+| 41 | File-isolation (test-target layout) | `TeamCode/src/test/java/org/firstinspires/ftc/teamcode/runhealth/api/EndToEndApiSmokeTest.java` — verifies RunStorage writes only into a designated `runs/` directory, never into sibling paths. The on-Hub check for `/FIRST/blocks/` vs `/FIRST/opmodes/` still requires a Hub. |
+
+All other test cases (Rec. modes 2–16, browser UI 18, 20, 23–32, and
+third-party integrations 35–40) require real hardware and must be
+executed on a Control Hub following the standard FTC test protocol.
+
+## JVM-test-environment caveats
+
+The JVM suite is best-effort and skips some assertions on Windows
+where the OS uses temp-directory junctions that confuse
+`FilenameSanitizer.isWithinDirectory`'s canonical-prefix check.
+Specifically, `EndToEndApiSmokeTest` skips on Windows-detected
+machines (`Assume.assumeFalse(os-name contains "Windows")` at
+`@Before`); tests run on Linux hosts and on a Mac.  This does **not**
+affect the production code path on the Hub, which only ever touches
+`/FIRST/RunHealth/runs/`.
+
+
 ## Reporting
 
 Each test should record:
@@ -76,3 +115,17 @@ Each test should record:
 * Comparing against rev-archived snapshots beyond the saved-runs
   trend view.
 * Multi-Club shared historical analysis (no cloud component).
+
+## Live telemetry (control hub)
+
+When executing on a physical Control Hub, verify:
+
+* `/runhealth/api/live/snapshot` responds 200 with `application/json`
+  within 5 ms under no-session and 50 ms under a synthetic publish.
+* `POST /runhealth/api/live/snapshot` returns 405 (rejected).
+* Recording mode OFF does not prevent live publishing — the
+  endpoint still returns a structured inactive snapshot.
+* Closing all browser tabs does not stop recording or break the
+  durable files on disk.
+* The Active flag flips to `false` exactly when `finish()` is
+  called by the session (and not before).

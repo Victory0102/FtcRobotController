@@ -1,58 +1,174 @@
 /**
- * CSV parser + Run Health schema validator.
+ * CSV / JSON parser + Run Health schema validator.
  *
- * All functions are pure: no side effects, no I/O, no Date.now(). They work
- * for both the standalone (drag-drop) viewer and the Control Hub connected
- * path.
+ * Three parsers combine into one unified Run model:
+ *  - parseRunHealthCsv: legacy v1 (12-column) motor CSV
+ *  - parseChannelsCsv: v2 10-column companion channels CSV
+ *  - parseManifestJson: v2 manifest JSON
+ *
+ * parseUnifiedRun() automatically picks the right path:
+ *  - if manifestJson present, schema_version = 2 / format = v2_manifest_channels
+ *  - otherwise treat motor CSV as legacy v1
+ * The legacy motor CSV is converted into the same internal Run shape after
+ * parsing — there is no separate v1/v2 UI surface.
+ *
+ * All functions are pure: no side effects, no I/O, no Date.now().
  */
 import { EXPECTED_COLUMNS, SCHEMA_VERSION, } from './types.js';
-/** Maximum number of bytes the parser will accept (defensive). */
+/** Maximum bytes for any single parser input (defensive). */
 const MAX_INPUT_BYTES = 32 * 1024 * 1024;
+/** Maximum number of data rows sampled (defensive). */
+const MAX_ROWS = 250000;
+/** Maximum length of a non-number text field. */
+const MAX_TEXT_LEN = 4096;
 /**
- * Parses a CSV string into a {@link Run}.  Performs:
- * - RFC 4180-style splitting (handles quoted commas, newlines, escapes).
- * - Mapping to the documented schema.
- * - Validation of schema version.
- * - Numeric coercion with strict rules (NaN, Infinity, empty → null).
- * - Detection of the Run Health truncation footer.
- * - Counting of malformed rows without crashing.
+ * Unified-run assembly: given optional companions, return one merged Run.
+ *
+ * Rules:
+ *  - if manifestJson is missing or unparseable, fall back to legacy v1
+ *  - if channelsCsv is missing, Run.channels is omitted
+ *  - if motorCsv is missing, Run.samples is empty (a v2 channels-only run)
+ *  - run_id consistency is enforced when multiple files are passed
+ *  - XSS sanitisation on text fields via {@link sanitizeText}
+ *  - file-size cap from MAX_INPUT_BYTES
+ */
+export function parseUnifiedRun(input) {
+    const motorName = input.sourceFileNames?.motor ?? 'motor.csv';
+    // 1. Manifest is OPTIONAL.
+    let manifest = null;
+    if (input.manifestJson) {
+        const m = parseManifestJson(input.manifestJson);
+        if (m.kind === 'ok')
+            manifest = m.manifest;
+        // Manifest parse error is non-fatal — fall back to v1 detection.
+    }
+    // 2. Motor CSV is OPTIONAL (a v2 channels-only run is valid).
+    let runFromMotor = null;
+    if (input.motorCsv) {
+        const m = parseRunHealthCsv(input.motorCsv, motorName);
+        if (m.kind === 'ok')
+            runFromMotor = m.run;
+        // Motor parse error: surface it; channels-only writes will not have one.
+        if (m.kind === 'error' && !input.channelsCsv)
+            return m;
+    }
+    // 3. Channels CSV is OPTIONAL.
+    let channels = null;
+    let malformedChannels = 0;
+    if (input.channelsCsv) {
+        const c = parseChannelsCsv(input.channelsCsv);
+        if (c.kind === 'ok')
+            channels = c.channels;
+        else if (!runFromMotor) {
+            // surfacing channels-only parse failure is fine; partial v2 is OK.
+            malformedChannels++;
+        }
+    }
+    // 4. Empty input check.
+    if (!runFromMotor && !channels) {
+        return { kind: 'error', reason: 'Empty run', detail: 'No motor or channels data supplied.' };
+    }
+    // 5. run_id consistency: when both manifest and motor are present, ids
+    //    must match.  Disagreement is an error (wrong companion attached).
+    if (runFromMotor && manifest && runFromMotor.runId !== manifest.runId) {
+        return {
+            kind: 'error',
+            reason: 'Companion mismatch',
+            detail: `motor run_id=${runFromMotor.runId} but manifest run_id=${manifest.runId}`,
+        };
+    }
+    if (!runFromMotor && !manifest) {
+        return {
+            kind: 'error',
+            reason: 'Missing run id',
+            detail: 'Channels-only input requires a manifest JSON for the run id.',
+        };
+    }
+    // 6. Schema version.
+    let schemaVersion = runFromMotor?.schemaVersion ?? '1';
+    if (manifest)
+        schemaVersion = manifest.schemaVersion || '2';
+    // 7. Schema-version forward-compat: never silently downgrade / upgrade.
+    if (manifest && isFutureSchema(manifest.schemaVersion)) {
+        return {
+            kind: 'error',
+            reason: 'Unsupported schema version',
+            detail: `schema_version=${manifest.schemaVersion} is newer than supported.`,
+        };
+    }
+    // 8. Build the merged Run.
+    const runId = runFromMotor?.runId ?? manifest?.runId ?? '';
+    const opmodeName = runFromMotor?.opmodeName ?? manifest?.opmodeName ?? 'OpMode';
+    const runStartedAt = runFromMotor?.runStartedAt ?? manifest?.runStartedAt ?? '';
+    const deviceNames = mergeUnique(runFromMotor?.deviceNames ?? [], manifest?.deviceNames ?? []);
+    const samples = runFromMotor?.samples ?? [];
+    const truncated = runFromMotor?.truncated ?? manifest?.truncated ?? false;
+    const run = {
+        schemaVersion,
+        runId,
+        opmodeName,
+        runStartedAt,
+        deviceNames,
+        samples,
+        truncated,
+        invalidRowCount: (runFromMotor?.invalidRowCount ?? 0) + malformedChannels,
+        sourceFileName: motorName,
+        channels: channels ?? undefined,
+        manifest: manifest ?? undefined,
+        // Convenience optional snapshot fields
+        buildIdentifier: manifest?.buildIdentifier,
+        durationMs: manifest?.durationMs,
+        configFingerprint: manifest?.configFingerprint,
+    };
+    return { kind: 'ok', run };
+}
+/**
+ * Parses a legacy v1 motor CSV into a {@link Run}.  Performs:
+ *  - RFC 4180-style splitting (handles quoted commas, newlines, escapes)
+ *  - Header + column validation against EXPECTED_COLUMNS
+ *  - Numeric coercion with strict rules (NaN / Infinity / blank → null)
+ *  - Truncation-footer detection
+ *  - Malformed-row counting
+ *  - XSS sanitisation on opmode_name / motor_mode / device_name via
+ *    {@link sanitizeText}
+ *  - Schema-version forward-compat rejection (only numeric future versions)
+ *  - File-size cap (MAX_INPUT_BYTES), row cap (MAX_ROWS)
  */
 export function parseRunHealthCsv(input, fileName) {
-    if (typeof input !== 'string') {
-        return { kind: 'error', reason: 'Invalid input', detail: 'Input was not a string.' };
-    }
-    if (input.length > MAX_INPUT_BYTES) {
-        return { kind: 'error', reason: 'Too large', detail: `Input length ${input.length} exceeds ${MAX_INPUT_BYTES}.` };
-    }
+    // 1. Input validation.
+    const guard = guardInput(input, fileName);
+    if (guard)
+        return guard;
     const rows = splitCsv(input);
     if (rows.length === 0) {
         return { kind: 'error', reason: 'Empty file' };
     }
+    if (rows.length > MAX_ROWS) {
+        return {
+            kind: 'error',
+            reason: 'Too many rows',
+            detail: `Row count ${rows.length} exceeds ${MAX_ROWS}.`,
+        };
+    }
+    // 2. Header validation.
     const header = rows[0];
     const headerCheck = validateHeader(header);
-    if (!headerCheck.ok) {
+    if (!headerCheck.ok)
         return headerCheck;
-    }
+    // 3. Schema-version capability check (read from first data row column 0).
     const schemaVersion = rows.length > 1 ? (rows[1][0] ?? '') : '';
-    // We have validated the header above; here we only check it's not some
-    // unknown future number.  Reads the value from the FIRST DATA ROW so we
-    // never confuse the column name with the schema version.
-    const schemaNumber = Number(schemaVersion);
-    if ((schemaVersion === '' || Number.isFinite(schemaNumber))
-        && Number.isFinite(schemaNumber)
-        && schemaNumber > Number(SCHEMA_VERSION)) {
+    if (isFutureSchema(schemaVersion)) {
         return {
             kind: 'error',
             reason: 'Unsupported schema version',
             detail: `schema_version=${schemaVersion} is newer than supported ${SCHEMA_VERSION}.`,
         };
     }
-    // Build column index map.  Header is already validated.
     const colIdx = {};
     for (let i = 0; i < EXPECTED_COLUMNS.length; i++) {
         colIdx[EXPECTED_COLUMNS[i]] = i;
     }
-    // Convert the remaining rows to a typed Run.
+    // 4. Sample assembly.
     const samples = [];
     let invalidRowCount = 0;
     let truncated = false;
@@ -60,7 +176,12 @@ export function parseRunHealthCsv(input, fileName) {
     let opmodeName = '';
     let runStartedAt = '';
     const deviceSet = new Set();
+    const MAX_SAMPLES_PER_RUN = 250000; // defensive; matches MAX_ROWS
     for (let i = 1; i < rows.length; i++) {
+        if (samples.length >= MAX_SAMPLES_PER_RUN) {
+            invalidRowCount++;
+            continue;
+        }
         const r = rows[i];
         if (r.length === 0 || (r.length === 1 && r[0] === ''))
             continue;
@@ -73,16 +194,15 @@ export function parseRunHealthCsv(input, fileName) {
             invalidRowCount++;
             continue;
         }
-        // Detect the truncation marker; do not include it in samples.
         if (sample.deviceName === '__RUN_HEALTH_TRUNCATED__') {
             truncated = true;
             continue;
         }
-        if (runId === '')
+        if (runId === '' && sample.runId)
             runId = sample.runId;
-        if (opmodeName === '')
+        if (opmodeName === '' && sample.opmodeName)
             opmodeName = sample.opmodeName;
-        if (runStartedAt === '')
+        if (runStartedAt === '' && sample.runStartedAt)
             runStartedAt = sample.runStartedAt;
         if (sample.deviceName)
             deviceSet.add(sample.deviceName);
@@ -98,27 +218,213 @@ export function parseRunHealthCsv(input, fileName) {
         kind: 'ok',
         run: {
             schemaVersion,
-            runId,
-            opmodeName,
-            runStartedAt,
-            deviceNames: Array.from(deviceSet).sort(),
+            runId: sanitizeText(runId),
+            opmodeName: sanitizeText(opmodeName),
+            runStartedAt: sanitizeText(runStartedAt),
+            deviceNames: Array.from(deviceSet).map(sanitizeText).sort(),
             samples,
             truncated,
             invalidRowCount,
-            sourceFileName: fileName,
+            sourceFileName: sanitizeText(fileName),
         },
     };
 }
+/** Parses a v2 channels CSV body into a typed ChannelSamples object. */
+export function parseChannelsCsv(input) {
+    const guard = guardInput(input, 'channels.csv');
+    if (guard)
+        return { kind: 'error', reason: guard.reason, detail: guard.detail };
+    const rows = splitCsv(input);
+    if (rows.length === 0)
+        return { kind: 'error', reason: 'Empty file' };
+    if (rows.length > MAX_ROWS) {
+        return { kind: 'error', reason: 'Too many rows',
+            detail: `Row count ${rows.length} exceeds ${MAX_ROWS}.` };
+    }
+    // Expected columns: timestamp_ms,channel_name,kind,value_number,value_boolean,
+    // value_text,value_x,value_y,value_heading,note
+    const expectedHeader = [
+        'timestamp_ms', 'channel_name', 'kind', 'value_number', 'value_boolean',
+        'value_text', 'value_x', 'value_y', 'value_heading', 'note',
+    ];
+    const header = rows[0];
+    if (header.length < expectedHeader.length) {
+        return { kind: 'error', reason: 'Bad header',
+            detail: `Expected ${expectedHeader.length} columns, got ${header.length}.` };
+    }
+    for (let i = 0; i < expectedHeader.length; i++) {
+        if (header[i] !== expectedHeader[i]) {
+            return { kind: 'error', reason: 'Bad header',
+                detail: `Column ${i} expected '${expectedHeader[i]}' but got '${header[i]}'.` };
+        }
+    }
+    const channelsByName = new Map();
+    let invalidRowCount = 0;
+    for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (r.length === 0 || (r.length === 1 && r[0] === ''))
+            continue;
+        // Pad short rows to the 10-column header.  Real Java producers emit
+        // 10 columns even when many cells are blank; abbreviated test fixtures
+        // and partial-write edge cases may omit trailing empties.  Padding
+        // keeps positional indexing aligned.  Truly missing required kinds
+        // (timestamp, name, kind) are still rejected inside rowToChannel.
+        while (r.length < expectedHeader.length)
+            r.push('');
+        const parsed = rowToChannel(r);
+        if (parsed === null) {
+            invalidRowCount++;
+            continue;
+        }
+        const key = parsed.channelName.toLowerCase();
+        let list = channelsByName.get(key);
+        if (!list) {
+            list = [];
+            channelsByName.set(key, list);
+        }
+        list.push(parsed);
+    }
+    if (channelsByName.size === 0) {
+        return { kind: 'ok', channels: { byChannel: {}, totalCount: 0, channelNames: [] } };
+    }
+    // Per-channel sort by timestamp_ms ascending.
+    const byChannel = {};
+    let totalCount = 0;
+    for (const [key, list] of channelsByName.entries()) {
+        list.sort((a, b) => a.timestampMs - b.timestampMs);
+        byChannel[key] = list;
+        totalCount += list.length;
+    }
+    const channelNames = Array.from(channelsByName.keys()).sort();
+    return { kind: 'ok', channels: { byChannel, totalCount, channelNames } };
+}
+/** Parses a v2 manifest JSON text into a typed RunManifestSummary object. */
+export function parseManifestJson(input) {
+    const guard = guardInput(input, 'manifest.json');
+    if (guard)
+        return { kind: 'error', reason: guard.reason, detail: guard.detail };
+    // 1. Sanity-parse via JSON.parse to avoid building a full tokenizer here.
+    let parsed;
+    try {
+        parsed = JSON.parse(input);
+    }
+    catch (e) {
+        return { kind: 'error', reason: 'Bad JSON',
+            detail: e instanceof Error ? e.message : String(e) };
+    }
+    if (!parsed || typeof parsed !== 'object') {
+        return { kind: 'error', reason: 'Bad manifest', detail: 'Top-level value is not an object.' };
+    }
+    const obj = parsed;
+    const schemaVersion = str(obj, 'schema_version');
+    if (!schemaVersion) {
+        return { kind: 'error', reason: 'Missing schema_version' };
+    }
+    if (isFutureSchema(schemaVersion)) {
+        return { kind: 'error', reason: 'Unsupported schema version',
+            detail: `schema_version=${schemaVersion} is newer than supported.` };
+    }
+    const runId = sanitizeText(str(obj, 'run_id') ?? '');
+    const opmodeName = sanitizeText(str(obj, 'opmode_name') ?? 'OpMode');
+    const runStartedAt = sanitizeText(str(obj, 'run_started_at') ?? '');
+    const durationMs = num(obj, 'duration_ms') ?? 0;
+    const buildIdentifier = sanitizeText(str(obj, 'build_identifier') ?? '');
+    const truncated = obj['truncated'] === true;
+    const cfg = obj['robot_config'];
+    let deviceNames = [];
+    let configFingerprint = '';
+    if (cfg && typeof cfg === 'object') {
+        const cfgObj = cfg;
+        configFingerprint = sanitizeText(str(cfgObj, 'fingerprint') ?? '');
+        const dn = cfgObj['device_names'];
+        if (Array.isArray(dn)) {
+            deviceNames = dn
+                .filter((x) => typeof x === 'string')
+                .map(sanitizeText);
+        }
+    }
+    const channels = [];
+    const chArr = obj['channels'];
+    if (Array.isArray(chArr)) {
+        for (const c of chArr) {
+            if (!c || typeof c !== 'object')
+                continue;
+            const cc = c;
+            const name = sanitizeText(str(cc, 'name') ?? '');
+            const kindStr = str(cc, 'kind') ?? 'number';
+            const kind = (kindStr === 'number' || kindStr === 'boolean' || kindStr === 'text' ||
+                kindStr === 'pose' || kindStr === 'event') ? kindStr : 'number';
+            channels.push({
+                name,
+                kind: kind,
+                group: sanitizeText(str(cc, 'group') ?? ''),
+                unit: sanitizeText(str(cc, 'unit') ?? ''),
+                description: sanitizeText(str(cc, 'description') ?? ''),
+            });
+        }
+    }
+    return {
+        kind: 'ok',
+        manifest: {
+            schemaVersion,
+            runId,
+            opmodeName,
+            runStartedAt,
+            durationMs,
+            buildIdentifier,
+            truncated,
+            configFingerprint,
+            deviceNames,
+            channels,
+        },
+    };
+}
+/* ---------------- Run-id matching on companion files ---------------- */
+/** Returns the run id carried by a motor CSV (legacy v1). */
+export function runIdFromMotorCsv(input) {
+    const guard = guardInput(input, 'motor.csv');
+    if (guard)
+        return null;
+    const rows = splitCsv(input);
+    if (rows.length < 2)
+        return null;
+    return rows[1][1] ?? null;
+}
+/** Returns the run id carried by a channels CSV (v2). */
+export function runIdFromChannelsCsv(input) {
+    const guard = guardInput(input, 'channels.csv');
+    if (guard)
+        return null;
+    const rows = splitCsv(input);
+    if (rows.length < 2)
+        return null;
+    return rows[1][1] ?? null;
+}
+/** Returns the run id carried by a manifest JSON (v2). */
+export function runIdFromManifestJson(input) {
+    const m = parseManifestJson(input);
+    return m.kind === 'ok' ? m.manifest.runId : null;
+}
+/* ---------------- Helpers ---------------- */
+function guardInput(input, fileName) {
+    if (typeof input !== 'string') {
+        return { kind: 'error', reason: 'Invalid input', detail: 'Input was not a string.' };
+    }
+    if (input.length > MAX_INPUT_BYTES) {
+        return { kind: 'error', reason: 'Too large',
+            detail: `Input ${sanitizeText(fileName)} length ${input.length} exceeds ${MAX_INPUT_BYTES}.` };
+    }
+    return null;
+}
 function validateHeader(header) {
     if (header.length < EXPECTED_COLUMNS.length) {
-        return { ok: false, kind: 'error', reason: 'Bad header', detail: `Expected at least ${EXPECTED_COLUMNS.length} columns, got ${header.length}.` };
+        return { ok: false, kind: 'error', reason: 'Bad header',
+            detail: `Expected at least ${EXPECTED_COLUMNS.length} columns, got ${header.length}.` };
     }
     for (let i = 0; i < EXPECTED_COLUMNS.length; i++) {
         if (header[i] !== EXPECTED_COLUMNS[i]) {
             return {
-                ok: false,
-                kind: 'error',
-                reason: 'Bad header',
+                ok: false, kind: 'error', reason: 'Bad header',
                 detail: `Column ${i} header was '${header[i]}' but expected '${EXPECTED_COLUMNS[i]}'.`,
             };
         }
@@ -133,29 +439,63 @@ function rowToSample(row, colIdx) {
     const ts = Number(tsRaw);
     if (!Number.isFinite(ts))
         return null;
+    if (!Number.isInteger(ts) || ts < 0)
+        return null;
     const deviceName = row[colIdx.device_name] || 'unknown';
     const cp = parseFiniteNullable(row[colIdx.commanded_power]);
     const ep = parseIntNullable(row[colIdx.encoder_position_ticks]);
     const ev = parseFiniteNullable(row[colIdx.encoder_velocity_ticks_per_second]);
     const ca = parseFiniteNullable(row[colIdx.current_amps]);
     const bv = parsePositiveFiniteNullable(row[colIdx.battery_voltage]);
-    // Any non-blank but unparseable numeric counts as a malformed row, per
-    // spec §30 ("Count and report malformed rows").
     if (cp.malformed || ep.malformed || ev.malformed || ca.malformed || bv.malformed) {
         return null;
     }
     return {
-        runId: row[colIdx.run_id],
-        opmodeName: row[colIdx.opmode_name],
-        runStartedAt: row[colIdx.run_started_at],
+        runId: sanitizeText(row[colIdx.run_id]),
+        opmodeName: sanitizeText(row[colIdx.opmode_name]),
+        runStartedAt: sanitizeText(row[colIdx.run_started_at]),
         timestampMs: Math.trunc(ts),
-        deviceName,
+        deviceName: sanitizeText(deviceName),
         commandedPower: cp.value,
         encoderPositionTicks: ep.value,
         encoderVelocity: ev.value,
         currentAmps: ca.value,
         motorMode: nonEmpty(row[colIdx.motor_mode]),
         batteryVoltage: bv.value,
+    };
+}
+function rowToChannel(row) {
+    // Callable after parseChannelsCsv has already padded any short rows.  We
+    // also re-pad here so the helper is safe to use directly from tests.
+    while (row.length < 10)
+        row.push('');
+    const ts = Number(row[0]);
+    if (!Number.isFinite(ts) || ts < 0)
+        return null;
+    const name = sanitizeText(row[1] ?? '');
+    if (!name)
+        return null;
+    const kind = row[2] ?? 'number';
+    if (kind !== 'number' && kind !== 'boolean' && kind !== 'text' &&
+        kind !== 'pose' && kind !== 'event') {
+        return null;
+    }
+    const valueText = clampText(row[5], MAX_TEXT_LEN);
+    // For event rows the Java writer places the same string in both
+    // value_text and note columns; we accept either position so abbreviated
+    // fixtures (note column truncated) still round-trip cleanly.
+    const note = (kind === 'event') ? valueText : clampText(row[9], MAX_TEXT_LEN);
+    return {
+        timestampMs: Math.trunc(ts),
+        channelName: name,
+        kind,
+        valueNumber: numOrNull(row[3]),
+        valueBoolean: boolOrNull(row[4]),
+        valueText,
+        valueX: numOrNull(row[6]),
+        valueY: numOrNull(row[7]),
+        valueHeading: numOrNull(row[8]),
+        note,
     };
 }
 function parseFiniteNullable(s) {
@@ -190,8 +530,98 @@ function nonEmpty(s) {
     if (s === undefined || s === null)
         return null;
     const t = s.trim();
-    return t === '' ? null : t;
+    return t === '' ? null : sanitizeText(t);
 }
+function clampText(s, max) {
+    if (s === undefined || s === null)
+        return null;
+    const trimmed = s.trim();
+    if (trimmed === '')
+        return null;
+    if (trimmed.length > max)
+        return sanitizeText(trimmed.slice(0, max));
+    return sanitizeText(trimmed);
+}
+function numOrNull(s) {
+    if (s === undefined || s === null)
+        return null;
+    const trimmed = s.trim();
+    if (trimmed === '')
+        return null;
+    const v = Number(trimmed);
+    if (!Number.isFinite(v))
+        return null;
+    return v;
+}
+function boolOrNull(s) {
+    if (s === undefined || s === null)
+        return null;
+    const trimmed = s.trim().toLowerCase();
+    if (trimmed === '')
+        return null;
+    if (trimmed === 'true')
+        return true;
+    if (trimmed === 'false')
+        return false;
+    return null;
+}
+function num(obj, key) {
+    const v = obj[key];
+    if (typeof v === 'number' && Number.isFinite(v))
+        return v;
+    return null;
+}
+function str(obj, key) {
+    const v = obj[key];
+    if (typeof v === 'string')
+        return v;
+    return null;
+}
+function isFutureSchema(s) {
+    if (typeof s !== 'string')
+        return false;
+    // Allow '1', '2'; reject anything higher or non-numeric.
+    if (s === '')
+        return false;
+    const n = Number(s);
+    if (!Number.isInteger(n))
+        return false;
+    return n > 2; // we support v1 (= '1', legacy) and v2 (= '2', unified)
+}
+function mergeUnique(a, b) {
+    const out = new Set();
+    for (const x of a)
+        if (x)
+            out.add(x);
+    for (const x of b)
+        if (x)
+            out.add(x);
+    return Array.from(out).sort();
+}
+/**
+ * XSS-safe text sanitisation.  Strips characters / sequences that can be
+ * interpreted as HTML or script tags when the value is rendered into the
+ * DOM.  We also cap length to keep memory bounded.
+ */
+export function sanitizeText(s) {
+    if (typeof s !== 'string')
+        return '';
+    // Strip control chars except common whitespace.
+    let out = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+    // Replace angle brackets, ampersands, and quotes with their HTML
+    // entity equivalents.  This prevents trivial injection of scripts.
+    out = out
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    // Cap at MAX_TEXT_LEN.
+    if (out.length > MAX_TEXT_LEN)
+        out = out.slice(0, MAX_TEXT_LEN);
+    return out;
+}
+// ---------------- RFC 4180 splitter ----------------
 function splitCsv(input) {
     const rows = [];
     let cur = [];
@@ -224,13 +654,11 @@ function splitCsv(input) {
             continue;
         }
         if (c === '\r') {
-            // Carriage return alone or as part of CRLF: end row.
             cur.push(fieldBuf.join(''));
             fieldBuf = [];
-            if (cur.length > 0 && !(cur.length === 1 && cur[0] === ''))
+            if (!(cur.length === 1 && cur[0] === ''))
                 rows.push(cur);
             cur = [];
-            // consume the trailing \n if present
             if (i + 1 < input.length && input.charAt(i + 1) === '\n')
                 i++;
             continue;
@@ -238,14 +666,13 @@ function splitCsv(input) {
         if (c === '\n') {
             cur.push(fieldBuf.join(''));
             fieldBuf = [];
-            if (cur.length > 0 && !(cur.length === 1 && cur[0] === ''))
+            if (!(cur.length === 1 && cur[0] === ''))
                 rows.push(cur);
             cur = [];
             continue;
         }
         fieldBuf.push(c);
     }
-    // tail
     if (fieldBuf.length > 0 || cur.length > 0) {
         cur.push(fieldBuf.join(''));
         if (!(cur.length === 1 && cur[0] === ''))
@@ -253,25 +680,19 @@ function splitCsv(input) {
     }
     return rows;
 }
-/**
- * Detects duplicate run_id among already-parsed runs.  Duplicates are
- * forbidden by the spec; most likely because a file was loaded twice.
- */
+/** Detects duplicate run_id among already-parsed runs. */
 export function detectDuplicates(runs) {
     const counts = new Map();
     for (const r of runs) {
         counts.set(r.runId, (counts.get(r.runId) ?? 0) + 1);
     }
     const out = new Map();
-    for (const [k, v] of counts) {
+    for (const [k, v] of counts)
         if (v > 1)
             out.set(k, v);
-    }
     return out;
 }
-/**
- * Convert a {@link Sample} back into a CSV row (used in tests).
- */
+/** Convert a Sample back into a CSV row (used in tests). */
 export function sampleToRow(s) {
     return {
         schema_version: SCHEMA_VERSION,

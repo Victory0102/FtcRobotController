@@ -85,3 +85,21 @@ the current build:
 * Behaviour after a forced shutdown or mid-run power cycle.
 
 See `CONTROL_HUB_TEST_PLAN.md` for the queued experiments.
+
+## Live view
+
+* Browser history is bounded to 60 seconds; older data is dropped to
+  keep the UI responsive.  Longer inspection must use saved runs
+  via the Replay tab.
+* Live viewing is polled (default 250 ms, exponential backoff up to
+  5 s).  Server-Sent Events / WebSocket are not used because the
+  FTC SDK web-handler contract does not expose a streaming response
+  shape that is portable across SDK versions.
+* The browser-bounded pose path is at most 600 points; the
+  Control-Hub unbounded pose history is not retained.
+* Live channels stream only the most-recent staged value per
+  channel name per tick.  Full history is preserved on disk in the
+  recorded channels.csv companion.
+* Live polling is GET-only; the FTC SDK web-handler contract does
+  not expose streaming responses cross-version, so polling is the
+  safest portable choice.

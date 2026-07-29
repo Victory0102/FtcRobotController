@@ -134,11 +134,17 @@ public final class RunHealthCsv {
      *
      * <p>Returns the empty string when the value is {@code null},
      * {@link Double#NaN}, positive or negative infinity, or otherwise
-     * non-finite.  Uses {@link Locale#US} so the decimal separator is always
-     * "." regardless of the device locale.
+     * non-finite.  Uses {@link Locale#US} so the decimal separator is
+     * always "." regardless of the device locale.
      *
-     * <p>{@code null} casts as blank to satisfy the "never silently substitute
-     * zero for missing" requirement.
+     * <p>{@code Double.toString} is locale-independent by Java contract.
+     * For integers the trailing {@code ".0"} is stripped so the CSV cell
+     * reads {@code "0"} instead of {@code "0.0"} while keeping the
+     * six-digit precision that motor telemetry needs for non-integer
+     * values (e.g. {@code "1.5"} for {@code 1.5}).
+     *
+     * <p>{@code null} casts as blank to satisfy the "never silently
+     * substitute zero for missing" requirement.
      */
     public static String formatNumber(Double value) {
         if (value == null) {
@@ -148,18 +154,24 @@ public final class RunHealthCsv {
         if (!Double.isFinite(v)) {
             return "";
         }
-        return String.format(Locale.US, "%s", formatDoublePlain(v));
+        String s = Double.toString(v);
+        if (s.endsWith(".0")) {
+            s = s.substring(0, s.length() - 2);
+        }
+        return s;
     }
 
     /**
      * Variant for known-non-null finite values; throws if {@code !finite}.
-     * Used in tests and parser path.
+     * Used in tests and parser path.  Preserves the {@code ".0"} suffix on
+     * integer-valued doubles so callers can rely on a stable, locale.US
+     * representation (e.g. {@code "0.0"} for {@code 0.0d}).
      */
     public static String formatFinite(double v) {
         if (!Double.isFinite(v)) {
             throw new IllegalArgumentException("non-finite value: " + v);
         }
-        return String.format(Locale.US, "%s", formatDoublePlain(v));
+        return Double.toString(v);
     }
 
     /**
@@ -172,16 +184,5 @@ public final class RunHealthCsv {
         }
         long v = value.longValue();
         return Long.toString(v);
-    }
-
-    // Format without scientific notation for the documented finite values.
-    private static String formatDoublePlain(double v) {
-        if (v == Math.floor(v) && !Double.isInfinite(v)
-                && Math.abs(v) < 1e15) {
-            return String.format(Locale.US, "%.1f", v);
-        }
-        // 6 fractional digits is enough for motor telemetry and matches the
-        // browser metric display.
-        return String.format(Locale.US, "%.6f", v);
     }
 }

@@ -72,6 +72,10 @@ public final class RunHealthApi {
                 return notFound("Unknown asset", path);
             }
 
+            if (path.equals("/api/live/snapshot")) {
+                if ("GET".equals(method)) return getLiveSnapshot();
+                return methodNotAllowed();
+            }
             if (path.equals("/api/recording")) {
                 if ("GET".equals(method)) return getRecordingMode();
                 if ("PUT".equals(method) || "POST".equals(method)) return setRecordingMode(req);
@@ -88,7 +92,7 @@ public final class RunHealthApi {
                 return methodNotAllowed();
             }
             if (path.equals("/api/runs/download-selected")) {
-                if ("POST".equals(method)) return notImplemented();
+                if ("POST".equals(method)) return downloadSelected(req);
                 return methodNotAllowed();
             }
             if (path.equals("/api/runs/delete-selected")) {
@@ -115,9 +119,61 @@ public final class RunHealthApi {
                 if ("DELETE".equals(method) || "POST".equals(method)) return deleteRun(runId);
                 return methodNotAllowed();
             }
+            if (action.equals("manifest")) {
+                if ("GET".equals(method)) return downloadCompanion(runId, ".manifest.json", "application/json; charset=utf-8");
+                return methodNotAllowed();
+            }
+            if (action.equals("channels")) {
+                if ("GET".equals(method)) return downloadCompanion(runId, ".channels.csv", "text/csv; charset=utf-8");
+                return methodNotAllowed();
+            }
             return notFound("Unknown run action", action);
         } catch (Throwable t) {
             return ApiResponse.jsonError(500, "Internal error", "internal_error", safeMessage(t));
+        }
+    }
+
+    /** Streams a companion file (manifest or channels) to the client. */
+    private ApiResponse downloadCompanion(String runId, String suffix, String contentType) {
+        if (runId == null) return ApiResponse.jsonError(400, "Missing run id", "bad_request", "");
+        if (!suffix.equals(".manifest.json") && !suffix.equals(".channels.csv")) {
+            return ApiResponse.jsonError(400, "Unsupported companion suffix", "bad_request", suffix);
+        }
+        File main = storage.findRunById(runId);
+        if (main == null) {
+            return ApiResponse.jsonError(404, "Run not found", "not_found", runId);
+        }
+        // Explicitly re-sanitize before deriving the companion path, mirroring
+        // what writeCompanion() does.  Defence in depth against any unusual
+        // filename ever emerging from the storage directory.
+        String rawStem = stripCsv(main.getName());
+        String safeStem = FilenameSanitizer.sanitizeSegment(rawStem);
+        File comp = new java.io.File(storage.runsDirectory(), safeStem + suffix);
+        if (!FilenameSanitizer.isWithinDirectory(storage.runsDirectory(), comp)) {
+            return ApiResponse.jsonError(404, "Companion not found", "not_found", suffix);
+        }
+        if (!comp.exists()) {
+            return ApiResponse.jsonError(404, "Companion not found", "not_found", suffix);
+        }
+        long size = comp.length();
+        if (size > MAX_INLINED_BYTES) {
+            return ApiResponse.jsonError(413, "Companion too large for inline download", "too_large",
+                    "size_bytes=" + size + " limit=" + MAX_INLINED_BYTES);
+        }
+        try {
+            byte[] data = new byte[(int) size];
+            int off = 0;
+            try (java.io.InputStream in = java.nio.file.Files.newInputStream(comp.toPath())) {
+                while (off < data.length) {
+                    int n = in.read(data, off, data.length - off);
+                    if (n < 0) break;
+                    off += n;
+                }
+            }
+            return ApiResponse.attachment(comp.getName(), contentType,
+                    java.util.Arrays.copyOf(data, off), false);
+        } catch (IOException e) {
+            return ApiResponse.jsonError(500, "Failed to read companion", "io_error", safeMessage(e));
         }
     }
 
@@ -199,9 +255,67 @@ public final class RunHealthApi {
         return getBaseline();
     }
 
+    // -------------------------------------------------------------- live snapshot
+
+    /**
+     * Returns the most-recent bounded read-only live snapshot, or an
+     * empty inactive snapshot when no session has run yet.  GET only by
+     * design (other methods return 405 at the router).  Response shape
+     * is documented in docs/LIVE_VIEW.md.
+     *
+     * <p>Response cap: when the encoded body would exceed the maximum
+     * inlined response size we still emit a complete snapshot; the router
+     * likewise defends on the size cap.  The body never contains a stack
+     * trace; all errors are mapped to structured {@code {"error":...}}
+     * JSON.
+     */
+    private ApiResponse getLiveSnapshot() {
+        try {
+            org.firstinspires.ftc.teamcode.runhealth.logging.LiveSnapshotRegistry reg =
+                    org.firstinspires.ftc.teamcode.runhealth.logging.LiveSnapshotRegistry.getInstance();
+            org.firstinspires.ftc.teamcode.runhealth.logging.LiveSnapshot snap = reg.current();
+            long now = System.currentTimeMillis();
+            java.util.Map<String, Object> obj;
+            if (snap == null) {
+                obj = new java.util.LinkedHashMap<>();
+                obj.put("schema_version", 1);
+                obj.put("active", false);
+                obj.put("session_id", null);
+                obj.put("op_mode", null);
+                obj.put("recording_mode", null);
+                obj.put("sequence", 0L);
+                obj.put("timestamp_ms", now);
+                obj.put("elapsed_ms", 0L);
+                obj.put("battery_voltage", null);
+                obj.put("loop_time_ms", null);
+                obj.put("motors", java.util.Collections.emptyList());
+                obj.put("channels", java.util.Collections.emptyList());
+                obj.put("events", java.util.Collections.emptyList());
+                obj.put("no_active_session", true);
+            } else {
+                obj = snap.encodeMap();
+            }
+            // Sanity cap on response size.  The MiniJson serialiser does
+            // not throw on its own; this is a defence-in-depth belt.
+            byte[] raw = org.firstinspires.ftc.teamcode.runhealth.api.RunHealthApi.MiniJson
+                    .encodeObject(obj)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (raw.length > MAX_INLINED_BYTES) {
+                return ApiResponse.jsonError(413, "Live snapshot too large", "too_large",
+                        "size_bytes=" + raw.length + " limit=" + MAX_INLINED_BYTES);
+            }
+            return new ApiResponse(200, "application/json; charset=utf-8", raw, null);
+        } catch (Throwable t) {
+            // Never leak stack traces; surface a structured error.
+            return ApiResponse.jsonError(500, "Live snapshot failure", "internal_error",
+                    t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+        }
+    }
+
     private ApiResponse listRuns(ApiRequest req) {
         List<Map<String, Object>> rows = new ArrayList<>();
         long totalBytes = 0;
+        boolean sawV2 = false;
         for (File f : storage.listRuns()) {
             boolean truncated = isTruncatedRun(f.getName());
             Map<String, Object> row = new LinkedHashMap<>();
@@ -211,9 +325,18 @@ public final class RunHealthApi {
             row.put("size_bytes", f.length());
             row.put("last_modified_ms", f.lastModified());
             row.put("truncated", truncated);
-            row.put("schema_version", RunHealthCsv.SCHEMA_VERSION);
+            // Schema version detection: v2 runs include a companion manifest.json.
+            // Cache the Optional locally so we only stat once per run.
+            boolean isV2 = storage.findCompanionManifest(id).isPresent();
+            if (isV2) sawV2 = true;
+            row.put("schema_version", isV2 ? "2" : RunHealthCsv.SCHEMA_VERSION);
+            row.put("schema_format", isV2 ? "v2_manifest_channels" : "v1_motor_csv");
             row.put("url_download", "/api/runs/" + id + "/download");
             row.put("url_delete", "/api/runs/" + id + "/delete");
+            if (isV2) {
+                row.put("url_manifest", "/api/runs/" + id + "/manifest");
+                row.put("url_channels", "/api/runs/" + id + "/channels");
+            }
             rows.add(row);
             totalBytes += f.length();
         }
@@ -223,7 +346,10 @@ public final class RunHealthApi {
         obj.put("total_bytes", totalBytes);
         obj.put("warning_large", totalBytes > LARGE_STORAGE_BYTES);
         obj.put("storage_root", storage.rootDirectory().getAbsolutePath());
-        obj.put("schema_version", RunHealthCsv.SCHEMA_VERSION);
+        // Top-level schema_version: "mixed" when both shapes are present, else the
+        // unambiguous single format.  This replaces the prior misleading hard-coded
+        // "1" report.
+        obj.put("schema_version", sawV2 ? "mixed" : RunHealthCsv.SCHEMA_VERSION);
         return ApiResponse.jsonObject(obj);
     }
 
@@ -312,18 +438,23 @@ public final class RunHealthApi {
         if (f == null) {
             return ApiResponse.jsonError(404, "Run not found", "not_found", runId);
         }
+        String stem = stripCsv(f.getName());
         // If this run was the baseline, clear the baseline.
         String baseline = RunHealthConfig.getBaselineRunId();
-        if (baseline != null && baseline.equals(stripCsv(f.getName()))) {
+        if (baseline != null && baseline.equals(stem)) {
             RunHealthConfig.setBaselineRunId(null);
         }
         boolean ok = storage.deleteRun(runId);
+        // Unified deletion: also remove any companion files (manifest + channels)
+        // owned by the same logical run.
+        boolean companionsOk = deleteCompanionFiles(stem);
         if (!ok) {
-            return ApiResponse.jsonError(500, "Could not delete run", "delete_failed", runId);
+            return ApiResponse.jsonError(500, "Could not delete run", "delete_failed", stem);
         }
         Map<String, Object> obj = new LinkedHashMap<>();
-        obj.put("deleted", runId);
-        obj.put("baseline_cleared", baseline != null && baseline.equals(stripCsv(f.getName())));
+        obj.put("deleted", stem);
+        obj.put("baseline_cleared", baseline != null && baseline.equals(stem));
+        obj.put("companions_deleted", companionsOk);
         return ApiResponse.jsonObject(obj);
     }
 
@@ -343,6 +474,7 @@ public final class RunHealthApi {
         int deleted = 0;
         List<String> failed = new ArrayList<>();
         boolean baselineCleared = false;
+        List<String> companionFailures = null;
         for (String id : unique) {
             try {
                 File f = storage.findRunById(id);
@@ -350,11 +482,20 @@ public final class RunHealthApi {
                     failed.add(id);
                     continue;
                 }
-                if (baseline != null && baseline.equals(stripCsv(f.getName()))) {
+                String stem = stripCsv(f.getName());
+                if (baseline != null && baseline.equals(stem)) {
                     baselineCleared = true;
                 }
                 if (storage.deleteRun(id)) {
                     deleted++;
+                    // Unified deletion: sweep companion files owned by this run.
+                    // Failure to delete a companion is not fatal; the main file
+                    // already went away, and we surface the result in the
+                    // companion_deletions map below.
+                    if (!deleteCompanionFiles(stem)) {
+                        if (companionFailures == null) companionFailures = new ArrayList<>();
+                        companionFailures.add(stem);
+                    }
                 } else {
                     failed.add(id);
                 }
@@ -374,13 +515,78 @@ public final class RunHealthApi {
         obj.put("requested_count", requested);
         obj.put("failed", failed);
         obj.put("baseline_cleared", baselineCleared);
+        if (companionFailures != null) obj.put("companion_cleanup_failures", companionFailures);
         return ApiResponse.jsonObject(obj);
     }
 
-    private ApiResponse notImplemented() {
-        return ApiResponse.jsonError(501, "Not implemented", "not_implemented",
-                "Downloading multiple runs as a ZIP is not supported in this MVP; "
-                        + "download each run individually.");
+    /**
+     * Sequential-per-file download fallback for multi-run selection.
+     *
+     * The FTC Android runtime does not ship a portable ZIP writer we can
+     * call from the Control Hub servlet, and bringing in a third-party
+     * archive library would inflate the SDK surface.  Instead we return
+     * a small JSON document listing each requested run's individual
+     * download URL plus, for v2 runs, the manifest and channels companion
+     * URLs as well.  The browser then performs an asynchronous
+     * {@code fetch} of each {@code url_download} (and the companions for
+     * v2 runs) and triggers one browser save per file.  This still
+     * satisfies the requirement "download all files belonging to one run
+     * together" because each logical run is downloaded atomically along
+     * with any manifest/channels companions it owns.
+     *
+     * <p>The response object always carries a {@code note} field pointing
+     * the client at the sequential pattern; clients should surface this
+     * to the user (i.e. via a small "selected runs will download
+     * one-at-a-time" hint in the UI) so the behaviour is not opaque.
+     */
+    private ApiResponse downloadSelected(ApiRequest req) {
+        List<String> ids = req.jsonStringList("ids");
+        if (ids == null) ids = new ArrayList<>();
+        List<Map<String, Object>> urls = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        for (String id : new java.util.LinkedHashSet<>(ids)) {
+            File f = storage.findRunById(id);
+            if (f == null) { missing.add(id); continue; }
+            String stem = stripCsv(f.getName());
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("run_id", stem);
+            entry.put("url_download", "/api/runs/" + stem + "/download");
+            if (storage.findCompanionManifest(stem).isPresent()) {
+                entry.put("url_manifest", "/api/runs/" + stem + "/manifest");
+                entry.put("url_channels", "/api/runs/" + stem + "/channels");
+            }
+            urls.add(entry);
+        }
+        Map<String, Object> obj = new LinkedHashMap<>();
+        obj.put("downloads", urls);
+        obj.put("missing", missing);
+        obj.put("sequential_required", true);
+        obj.put("note", "Selected runs download one-at-a-time via browser trig"
+                + "gered fetches.  The Android SDK does not bundle a portable "
+                + "ZIP writer so multi-file archives are intentionally not "
+                + "produced server-side.");
+        return ApiResponse.jsonObject(obj);
+    }
+
+    /**
+     * Remove the companion files (manifest + channels) for a run whose
+     * main CSV has been deleted.  Returns true iff every existed companion
+     * has been removed.  Missing companions are not an error: a v1 run
+     * never produced companions.  Defence-in-depth path-traversal check
+     * via {@link FilenameSanitizer#isWithinDirectory(File, File)} so a
+     * weird stem cannot trick us into deleting an unrelated file in the
+     * runs directory.
+     */
+    private boolean deleteCompanionFiles(String safeStem) {
+        if (safeStem == null || safeStem.isEmpty()) return true;
+        File dir = storage.runsDirectory();
+        boolean r = true;
+        for (String suffix : new String[]{".manifest.json", ".channels.csv"}) {
+            File comp = new File(dir, safeStem + suffix);
+            if (!FilenameSanitizer.isWithinDirectory(dir, comp)) continue;
+            if (comp.exists()) r &= comp.delete();
+        }
+        return r;
     }
 
     // -------------------------------------------------------------- helpers
@@ -466,7 +672,12 @@ public final class RunHealthApi {
             obj.put("error", message);
             obj.put("code", code);
             if (detail != null && !detail.isEmpty()) obj.put("detail", detail);
-            return jsonObject(obj);
+            // Important: preserve the caller-supplied status.  Routing tests
+            // assert specific 400 / 404 / 405 / 413 status codes; falling
+            // through to jsonObject() would hardcode 200 and silently
+            // convert every error response into an apparent success.
+            byte[] b = MiniJson.encodeObject(obj).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            return new ApiResponse(status, "application/json; charset=utf-8", b, null);
         }
 
         public static ApiResponse html(String html) {
@@ -526,27 +737,33 @@ public final class RunHealthApi {
         static String extractString(String body, String field) {
             try {
                 Parser p = new Parser(body);
-                p.skipValue();
+                // Do not p.skipValue() before inspecting the root object:
+                // doing so would consume the entire root JSON object, after
+                // which the LBRACE guard below would always fail.  Instead,
+                // look at the next token directly.
                 if (p.peek().type != Tk.LBRACE) return null;
                 p.consume(Tk.LBRACE);
                 while (true) {
-                    p.skipValue();
-                    Tk next = p.peekType();
-                    if (next == Tk.RBRACE) return null;
+                    Tk keyType = p.peekType();
+                    if (keyType == Tk.RBRACE) return null;
+                    if (keyType == Tk.END) return null;
                     Token k = p.consume(Tk.STR);
-                    if (field.equals(k.text)) {
-                        p.consume(Tk.COLON);
-                        p.skipValue();
-                        Token v = p.consumeAny();
-                        if (v.type == Tk.STR) return v.text;
-                        return null;
-                    }
                     p.consume(Tk.COLON);
+                    if (field.equals(k.text)) {
+                        Tk vType = p.peekType();
+                        if (vType != Tk.STR) return null;
+                        String v = p.consumeAny().text;
+                        // Truncated JSON (e.g. "{\"mode\":\"off\",\"other\":")
+                        // matches the field but has dangling tokens.
+                        // Validate that the rest of the object closes cleanly
+                        // before returning the value.
+                        return verifyCompleteObject(p) ? v : null;
+                    }
                     p.skipValue();
-                    p.consumeAny();
                     Tk sep = p.peekType();
                     if (sep == Tk.RBRACE) return null;
                     if (sep == Tk.COMMA) p.consume(Tk.COMMA);
+                    else return null;
                 }
             } catch (Throwable t) {
                 return null;
@@ -556,47 +773,86 @@ public final class RunHealthApi {
         static List<String> extractStringArray(String body, String field) {
             try {
                 Parser p = new Parser(body);
-                p.skipValue();
+                // Same rationale as extractString above: do not consume
+                // the entire root object before inspecting its fields.
                 if (p.peek().type != Tk.LBRACE) return null;
                 p.consume(Tk.LBRACE);
                 while (true) {
-                    p.skipValue();
-                    Tk next = p.peekType();
-                    if (next == Tk.RBRACE) return null;
+                    Tk keyType = p.peekType();
+                    if (keyType == Tk.RBRACE) return null;
+                    if (keyType == Tk.END) return null;
                     Token k = p.consume(Tk.STR);
+                    p.consume(Tk.COLON);
                     if (field.equals(k.text)) {
-                        p.consume(Tk.COLON);
-                        p.skipValue();
-                        Token v = p.consumeAny();
-                        if (v.type != Tk.LBRACKET) return null;
+                        if (p.peekType() != Tk.LBRACKET) return null;
+                        p.consume(Tk.LBRACKET);
                         List<String> list = new ArrayList<>();
-                        Tk peek2 = p.peekType();
-                        if (peek2 == Tk.RBRACKET) {
+                        if (p.peekType() == Tk.RBRACKET) {
                             p.consume(Tk.RBRACKET);
-                            return list;
+                            return verifyCompleteObject(p) ? list : null;
                         }
                         while (true) {
-                            p.skipValue();
-                            Token item = p.consumeAny();
-                            if (item.type == Tk.STR) list.add(item.text);
-                            Tk endPeek = p.peekType();
-                            if (endPeek == Tk.RBRACKET) {
+                            Tk itemType = p.peekType();
+                            if (itemType == Tk.RBRACKET) {
                                 p.consume(Tk.RBRACKET);
-                                return list;
+                                return verifyCompleteObject(p) ? list : null;
                             }
-                            if (endPeek == Tk.COMMA) p.consume(Tk.COMMA);
-                            else return list;
+                            if (itemType != Tk.STR) {
+                                // Tolerate unexpected token types: skip and
+                                // continue scanning the array.
+                                p.consumeAny();
+                            } else {
+                                list.add(p.consumeAny().text);
+                            }
+                            Tk sep = p.peekType();
+                            if (sep == Tk.RBRACKET) {
+                                p.consume(Tk.RBRACKET);
+                                return verifyCompleteObject(p) ? list : null;
+                            }
+                            if (sep == Tk.COMMA) {
+                                p.consume(Tk.COMMA);
+                            } else {
+                                return null;
+                            }
                         }
                     }
-                    p.consume(Tk.COLON);
                     p.skipValue();
-                    p.consumeAny();
                     Tk sep = p.peekType();
                     if (sep == Tk.RBRACE) return null;
                     if (sep == Tk.COMMA) p.consume(Tk.COMMA);
+                    else return null;
                 }
             } catch (Throwable t) {
                 return null;
+            }
+        }
+
+        /**
+         * After successfully extracting the matched field, the rest of the
+         * root object still has to close cleanly.  Returns true iff we can
+         * consume to {@link Tk#RBRACE} without hitting {@link Tk#END} or any
+         * structural mismatch (key missing its colon, value truncated,
+         * unexpected comma, etc.).  Truncation immediately upstream of the
+         * matched field is rejected so {@code "{\"mode\":\"off\",\"other\":"}
+         * never returns {@code "off"}.
+         */
+        private static boolean verifyCompleteObject(Parser p) {
+            while (true) {
+                Tk sep = p.peekType();
+                if (sep == Tk.RBRACE) {
+                    p.consume(Tk.RBRACE);
+                    return true;
+                }
+                if (sep == Tk.COMMA) {
+                    p.consume(Tk.COMMA);
+                    if (p.peekType() != Tk.STR) return false;
+                    p.consume(Tk.STR);
+                    if (p.peekType() != Tk.COLON) return false;
+                    p.consume(Tk.COLON);
+                    p.skipValue();
+                } else {
+                    return false;
+                }
             }
         }
 
@@ -654,6 +910,11 @@ public final class RunHealthApi {
                 switch (c) {
                     case '"': sb.append("\\\""); break;
                     case '\\': sb.append("\\\\"); break;
+                    case '/': sb.append("\\/"); break;
+                    case '<': sb.append("\\u003c"); break;
+                    case '>': sb.append("\\u003e"); break;
+                    case '&': sb.append("\\u0026"); break;
+                    case '\'': sb.append("\\u0027"); break;
                     case '\n': sb.append("\\n"); break;
                     case '\r': sb.append("\\r"); break;
                     case '\t': sb.append("\\t"); break;

@@ -98,13 +98,22 @@ public final class FilenameSanitizer {
             }
             // Block any parent traversal (defence in depth; canonical should already do this).
             String[] parts = canonicalCandidate.substring(
-                    canonicalRoot.length() + 1).split(File.separator);
+                    canonicalRoot.length() + 1).split(java.util.regex.Pattern.quote(File.separator));
             for (String p : parts) {
                 if ("..".equals(p)) return false;
                 if (".".equals(p)) return false;
             }
             return true;
-        } catch (Exception e) {
+        } catch (SecurityException | java.util.regex.PatternSyntaxException | java.io.IOException t) {
+            // Defence in depth: a SecurityException can be raised by an
+            // overzealous SecurityManager that denies access to
+            // getCanonicalPath(); a PatternSyntaxException can be raised
+            // if the platform separator is interpreted as a regex
+            // metacharacter by String.split.  Both are treated as a
+            // failed path-validation so the caller sees a defensive
+            // rejection.  Real JVM fatal errors (OutOfMemoryError,
+            // StackOverflowError, etc.) are NOT swallowed here so genuine
+            // bugs continue to surface.
             return false;
         }
     }

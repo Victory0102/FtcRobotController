@@ -170,21 +170,21 @@ public class RunHealthApiTest {
 
     @Test
     public void miniJson_extractsStringList() {
-        java.util.List<String> ids = RunHealthApi.MiniJson.extractStringList(
+        java.util.List<String> ids = RunHealthApi.MiniJson.extractStringArray(
                 "{\"ids\":[\"a\",\"b\",\"c\"]}", "ids");
         assertNotNull(ids);
         assertEquals(3, ids.size());
         assertEquals("a", ids.get(0));
         assertEquals("c", ids.get(2));
 
-        java.util.List<String> empty = RunHealthApi.MiniJson.extractStringList(
+        java.util.List<String> empty = RunHealthApi.MiniJson.extractStringArray(
                 "{\"ids\":[]}", "ids");
         assertNotNull(empty);
         assertEquals(0, empty.size());
 
-        assertNull(RunHealthApi.MiniJson.extractStringList(
+        assertNull(RunHealthApi.MiniJson.extractStringArray(
                 "{\"ids\":42}", "ids"));
-        assertNull(RunHealthApi.MiniJson.extractStringList(
+        assertNull(RunHealthApi.MiniJson.extractStringArray(
                 "{}", "ids"));
     }
 
@@ -271,12 +271,15 @@ public class RunHealthApiTest {
     }
 
     @Test
-    public void routing_downloadSelected_NotImplemented() {
+    public void routing_downloadSelected_ReturnsJsonList() {
+        // /api/runs/download-selected now returns a JSON list of per-run
+        // download URLs (sequential fallback because the SDK does not
+        // bundle a portable ZIP writer - documented in the response body).
         RunHealthApi api = new RunHealthApi(new org.firstinspires.ftc.teamcode.runhealth.logging.RunStorage(
                 scratchDir()));
         RunHealthApi.ApiResponse resp = api.handle(
                 new RunHealthApi.ApiRequest("POST", "/api/runs/download-selected", "", null));
-        assertEquals(501, resp.status);
+        assertEquals(200, resp.status);
     }
 
     @Test
@@ -328,6 +331,39 @@ public class RunHealthApiTest {
 
     private static String strip(String n) {
         return n.endsWith(".csv") ? n.substring(0, n.length() - 4) : n;
+    }
+
+    /**
+     * Calls {@link RunHealthConfig#clear()} and confirms the static
+     * state is reset between tests.  Without this, the JVM suite leaks
+     * recording-mode / baseline-run-id across tests because both live
+     * behind a shared static field.
+     */
+    @Test
+    public void config_reset_clearsStaticState() {
+        org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig
+                .setRecordingMode(org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.MODE_EVERY);
+        org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig
+                .setBaselineRunId("some-id");
+        org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.clear();
+        assertEquals(
+                org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.MODE_OFF,
+                org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.getRecordingMode());
+        assertNull(
+                org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.getBaselineRunId());
+    }
+
+    /**
+     * We intentionally allow scientific notation in the channels CSV
+     * for very small or very large finite doubles so that {@code Double.toString}
+     * round-trips across the Java / JavaScript boundary cleanly.
+     */
+    @Test
+    public void scientificNotation_roundTripsThroughParseDouble() {
+        String s = Double.toString(1e-7);
+        Double parsed = Double.parseDouble(s);
+        assertNotNull(parsed);
+        assertEquals(1e-7, parsed.doubleValue(), 1e-15);
     }
 
     private static java.io.File scratchDir() {

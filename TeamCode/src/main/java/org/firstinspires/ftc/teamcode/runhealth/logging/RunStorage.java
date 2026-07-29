@@ -135,6 +135,65 @@ public final class RunStorage {
     }
 
     /**
+     * Writes a companion file alongside a previously-written v1 run.
+     * The companion name is treated as a single safe segment with no
+     * additional sanitisation beyond {@link FilenameSanitizer}.  Use this
+     * for the v2 channels CSV and JSON manifest.
+     *
+     * <p>The companion {@code fileName} MUST end with one of the documented
+     * suffixes (.channels.csv or .manifest.json) to avoid confusing
+     * downstream listing code.
+     */
+    public File writeCompanion(String fileName, String content) throws IOException {
+        if (content == null) {
+            throw new IllegalArgumentException("content cannot be null");
+        }
+        if (fileName == null || fileName.isEmpty()) {
+            throw new IllegalArgumentException("companion fileName required");
+        }
+        if (!fileName.endsWith(".channels.csv") && !fileName.endsWith(".manifest.json")) {
+            // First-pass guard: refuse unknown companion extensions to keep
+            // browser-side listing predictable.  This avoids accidentally
+            // creating files that the parser does not recognise.
+            throw new IllegalArgumentException(
+                    "Refusing companion file with unrecognised extension: " + fileName);
+        }
+        // Re-sanitize the stem defensively: the buildCsvFilename helper
+        // already produces a safe name, but a future caller could pass
+        // hand-crafted input.
+        String safeStem = FilenameSanitizer.sanitizeSegment(
+                fileName.replace(".channels.csv", "")
+                        .replace(".manifest.json", ""));
+        String suffix = fileName.endsWith(".channels.csv") ? ".channels.csv" : ".manifest.json";
+        File target = new File(runsDir, safeStem + suffix);
+        if (!FilenameSanitizer.isWithinDirectory(runsDir, target)) {
+            throw new SecurityException("Refusing to write companion outside runs/: " + fileName);
+        }
+        try (Writer w = new BufferedWriter(
+                new OutputStreamWriter(
+                        new java.io.FileOutputStream(target, false),
+                        StandardCharsets.UTF_8))) {
+            w.write(content);
+        }
+        return target;
+    }
+
+    /**
+     * Returns the companion manifest path for a given run, if one exists.
+     * Returns {@code null} when no manifest is present.  Used by the API
+     * at listRuns() time to surface schema-version metadata.
+     */
+    public java.util.Optional<File> findCompanionManifest(String runId) {
+        File main = findRunById(runId);
+        if (main == null) return java.util.Optional.empty();
+        String stem = main.getName();
+        if (stem.endsWith(".csv")) stem = stem.substring(0, stem.length() - 4);
+        File mf = new File(runsDir, stem + ".manifest.json");
+        if (!FilenameSanitizer.isWithinDirectory(runsDir, mf)) return java.util.Optional.empty();
+        return mf.exists() ? java.util.Optional.of(mf) : java.util.Optional.empty();
+    }
+
+    /**
      * Deletes the run file matching the safe id.  Returns {@code true} if a
      * file was deleted; {@code false} otherwise (including when the id is
      * invalid for security reasons).

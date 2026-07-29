@@ -45,3 +45,13 @@ need stronger controls.  See `LIMITATIONS.md`.
 * No data is sent to any cloud service.
 * No data is sent to a phone running Outside Driver Station code.
 * No telemetry metadata about runs leaks outside the Control Hub LAN.
+
+## Live snapshot endpoint
+
+`GET /runhealth/api/live/snapshot` is **GET only** — POST/PUT/DELETE
+are rejected with 405 by the router.  No request body is parsed on
+this path; absent body means absent input.  Stack traces are never
+returned; structured `{"error":...,"code":...}` JSON is returned on
+failures.  No setter on any hardware is reachable from this route.
+Channel names and label values are emitted as JSON-escaped strings
+so `<script>` cannot inject HTML in the browser.

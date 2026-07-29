@@ -80,6 +80,7 @@ public final class RunHealthWeb {
                 "/runhealth/api/recording",
                 "/runhealth/api/baseline",
                 "/runhealth/api/runs",
+                "/runhealth/api/live/snapshot",
                 "/runhealth/assets/",
         };
         for (String p : paths) {

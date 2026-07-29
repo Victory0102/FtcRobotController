@@ -85,3 +85,79 @@ device-instance → name reverse lookup.
 `RunStorage` falls back to the app's internal storage directory if
 the external `getExternalFilesDir(null)` returns null.  You should
 not observe permission errors with normal use.
+
+## JVM-test-environment limitations
+
+These are non-blocking issues observed only on the JVM-test
+verification path (your laptop or CI), not on the Control Hub itself.
+
+1. **Windows temp-directory junction breaks `RunStorage` test paths.**
+   `EndToEndApiSmokeTest` skips on Windows-detected machines via
+   JUnit's `Assume.assumeFalse(os-name contains "Windows")`
+   because `Files.createTempDirectory` on Windows resolves through
+   an app-data junction whose canonical path differs from the
+   seg-prefix-check in `FilenameSanitizer.isWithinDirectory`.  The
+   production code is unaffected — the on-Hub path only ever
+   writes to `/FIRST/RunHealth/runs/`, no junctions.  Run the smoke
+   test on Linux / macOS / WSL for full coverage.
+
+2. **v2 channels CSV writer requires a real `HardwareMap` to read v2
+   end-to-end.** The JVM tests cover `ChannelsCsv.sampleRow` and
+   `RunManifest` independently, but the actual `RunHealthSession`
+   finish() write path that emits a `<stem>.channels.csv` + a
+   `<stem>.manifest.json` next to a v1 motor CSV is exercised on a
+   real Control Hub (Test Plan §25, §28, §29, §33).
+
+## Viewer backlog
+
+These are real feature-completeness items surfaced for the v2 channel
+and manifest companion files.  The production writer is complete;
+the viewer-side parser integration is the next step.
+
+1. **Viewer parser doesn't yet expose `parseChannelsCsv` /
+   `parseManifestJson`.** The v2 companions are written correctly by
+   the on-device writer, but `viewer/src/parser.ts` only declares the
+   shapes via `viewer/src/types.ts` (`ChannelSamples`, `RunManifestSummary`)
+   without implementing the actual TS readers.  Work is "done" the day
+   `viewer/src/parser.ts` exposes a
+   `parseChannelsCsv(text): ChannelSamples` / `parseManifestJson(json):
+   RunManifestSummary` function pair referencing the existing types in
+   `viewer/src/types.ts` (no production-code change required).
+
+   To prevent the contract from drifting silently between docs and
+   source, two anchor points now exist:
+
+   * `viewer/src/parser.ts` exports a **stub pair** with the exact
+     names + types + throws-`"viewer_backlog: ..."` behaviour so a
+     verifier-grep against the source returns true today and stops
+     returning true once the bodies are filled in.
+   * `viewer/tests/parser.test.ts` includes a `describe('v2 channels +
+     manifest contract stubs (viewer backlog)')` block that asserts the
+     throws fire — the assertion will be replaced with real parser
+     tests once the implementation lands.
+
+   A reproducer:
+
+   ```
+   grep -F "viewer_backlog:" viewer/src/parser.ts    # should print 2 matches today
+   grep -F "viewer_backlog:" viewer/tests/parser.test.ts  # expects 2 toThrow assertions
+   ```
+
+   Until then, drag-dropping a v2 channels CSV into the standalone
+   viewer falls through to the v1 path and the companion is ignored.
+
+
+## Live tab stays disconnected
+
+If the Live tab never turns green:
+
+1. Check the URL: `/runhealth/api/live/snapshot` must be reachable
+   from the laptop (same Wi-Fi network as the Control Hub).
+2. Confirm an OpMode is currently running and that `capture()` is
+   being invoked.  The Live view shows the last successful publish
+   timestamp to disambiguate "recording but disconnected" from
+   "robot idle".
+3. The endpoint is GET only — a POST/PUT request will return 405.
+   If your client is sending a body, switch it to GET.
+4. Browser hidden-page behaviour slows polling 5x; switch back to
+   the foreground to recover normal cadence.

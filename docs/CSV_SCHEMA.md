@@ -74,3 +74,84 @@ double-quote-escaped per RFC 4180; embedded double-quotes are doubled
 * Renaming existing columns also requires bumping the schema version.
 * Unknown columns are rejected by the parser unless the schema version
   increments; this is why future versions must change the version.
+
+## v2 channels CSV (companion to a v1 run)
+
+A v2 run additionally writes a **per-channel** CSV alongside the v1
+motor CSV.  The companion schema is `recorder_schema_version = 2`; the
+presence of a `<run-stem>.channels.csv` and `<run-stem>.manifest.json`
+signals v2 to the API.  Both files use the same UTC ISO-8601 run id
+within the filename as the v1 motor CSV.
+
+The companion `<stem>.manifest.json` points at this file via the
+`channels_file` field — read the manifest first to discover the
+schema_version and the channels CSV path.  A viewer-side parser
+**must not** read the channels CSV in isolation; the manifest is the
+authoritative index of the run.
+
+The manifest filename is `<stem>.manifest.json`, sitting next to
+`<stem>.channels.csv`, where `stem` matches the v1 motor CSV stem
+minus `.csv` (i.e. `<UTC-with-dashes>-<opmode>-<short_id>`).  If the
+v1 motor CSV is truncated, the same stem is used and the `-truncated`
+marker is preserved on the companion files.
+
+A `<stem>.channels.csv` without its companion `<stem>.manifest.json`,
+or a manifest without its channels CSV, is a **partial write** (the
+`finish()` path emits files in order: motor CSV → channels CSV →
+manifest, so a crash between steps leaves pairs incomplete).  Parsers
+SHOULD treat any partial-write pair as truncated and surface the same
+warning the parser surfaces for `__RUN_HEALTH_TRUNCATED__` footers.
+
+### Column order (10 columns, stable)
+
+```
+timestamp_ms,channel_name,kind,value_number,value_boolean,value_text,value_x,value_y,value_heading,note
+```
+
+| # | Column | Type | Notes |
+|---|--------|------|-------|
+| 1 | `timestamp_ms` | integer | Monotonic elapsed time, milliseconds. |
+| 2 | `channel_name` | string | The user-facing channel name; see "Reserved literal" below for the EVENT exception. |
+| 3 | `kind` | string | One of `number`, `boolean`, `text`, `pose`, `event`. |
+| 4 | `value_number` | float | Populated for `kind=number`. Blank otherwise. |
+| 5 | `value_boolean` | string | `true` or `false` for `kind=boolean`. Blank otherwise. |
+| 6 | `value_text` | string | Populated for `kind=text` and `kind=event`. Blank otherwise. |
+| 7 | `value_x` | float | Populated for `kind=pose`. Blank otherwise. |
+| 8 | `value_y` | float | Populated for `kind=pose`. Blank otherwise. |
+| 9 | `value_heading` | float | Populated for `kind=pose`. Blank otherwise. |
+| 10 | `note` | string | Free-form note. For `kind=event` rows, the same text appears here and in `value_text`. May be empty for `kind=event`. |
+
+> The channels CSV carries **no `schema_version` column of its own** —
+> its schema version lives in the companion manifest's
+> `schema_version` field.  A parser that looks for a version column on
+> the CSV will not find one.
+
+### Reserved literal for EVENT rows
+
+The `channel_name` column for `kind=event` rows is always the wire
+literal `__event__` (defined as `ChannelsCsv.EVENT_CHANNEL_NAME` in
+production), regardless of what name the caller passes to
+`RunHealthSession.mark(...)`.  Browser-side event filters MUST compare
+against the literal string `__event__` as a stable, machine-derived
+constant — not as a user-editable label.  All non-EVENT rows carry the
+clamped user-supplied name through `ChannelSpec.validateName`.
+
+### Numeric formatting
+
+Same rules as the v1 motor CSV: Locale.US, finite-only, at most six
+fractional digits, integer-valued doubles use one fractional digit.
+
+### Encoding
+
+UTF-8.  RFC 4180 quoting.  Rows sorted by `(timestamp_ms, channel_name)`
+before write for stable diffs.
+
+### Compatibility
+
+* `kind=event` row structure is contractual; the wire literal
+  `__event__` must not change without a schema bump.
+* `ChannelsCsv.EVENT_CHANNEL_NAME` (in production code) is the single
+  source of truth for this literal — both the writer and any consumer
+  (browser parser, analytics tool) should reference it.  The wire
+  value is always the plain string `__event__`.
+
