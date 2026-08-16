@@ -1,3 +1,216 @@
+# FTC Run Health
+
+FTC Run Health is a read-only motor-performance recorder and browser dashboard for FIRST Tech Challenge robots. It helps teams replace visual guesses with repeatable evidence by showing live motor command, encoder velocity, current draw, battery voltage, saved-run replay, run-to-run overlays, long-term trends, and cautious diagnostic warnings.
+
+The dashboard is bundled into the Robot Controller APK. A testing computer only needs to join the robot Wi-Fi and open a browser.
+
+## What It Does
+
+- Streams live motor power, velocity, current, mode, and battery voltage.
+- Records integrated OpMode runs at up to 10 Hz.
+- Supports **Off**, **Save Next Run**, and **Save Every Run**.
+- Starts browser downloads for newly completed runs while the dashboard remains open.
+- Makes ready Hub and imported runs available to Compare, Replay, Channels, and Trends.
+- Overlays runs by time and matched commanded-power bands.
+- Calculates response, current cost, high-current exposure, and possible-stall exposure.
+- Produces evidence-based wear warnings with an explicit confidence level.
+- Never sends motor commands or changes robot configuration, device names, controls, modes, directions, targets, PID values, or zero-power behavior.
+
+## Dashboard
+
+Connect the computer to the Control Hub Wi-Fi and open:
+
+**[http://192.168.43.1:8080/runhealth/](http://192.168.43.1:8080/runhealth/)**
+
+| Section | Purpose |
+|---|---|
+| Live | Watch recent motor command, velocity, current, battery, events, and custom channels. |
+| Saved Runs | Arm recording, inspect Hub runs, download, delete, retry analysis, or choose a baseline. |
+| Compare | Overlay two runs and evaluate motor response under matching command conditions. |
+| Replay | Scrub or play a recorded run on a shared timeline. |
+| Channels | Inspect optional numeric, boolean, text, and event data. |
+| Trends | Follow a selected motor metric across dates. |
+| Import | Load downloaded motor CSV, manifest, and channel files locally. |
+
+Every major graph, table, metric, and status has visible labels and plain-language help in the UI.
+
+## Requirements
+
+- FTC Robot Controller project with the `TeamCode` module.
+- REV Control Hub or another supported Android Robot Controller device.
+- Android Studio and Android SDK Platform Tools (`adb`).
+- Motors exposed as `DcMotorEx` for velocity/current diagnostics.
+- Working encoders for meaningful velocity analysis.
+- Chromium-based browser on a computer connected to robot Wi-Fi.
+
+## Build
+
+From the repository root in PowerShell:
+
+```powershell
+.\gradlew.bat :TeamCode:clean :TeamCode:testDebugUnitTest :TeamCode:assembleDebug
+```
+
+APK output:
+
+```text
+TeamCode\build\outputs\apk\debug\TeamCode-debug.apk
+```
+
+To rebuild only the browser dashboard:
+
+```powershell
+Set-Location viewer
+npm install
+npm test
+npm run build
+```
+
+`npm run build` copies production browser files into `TeamCode/src/main/assets/runhealth/` for APK packaging.
+
+## Install With ADB
+
+Connect the computer to Control Hub Wi-Fi. In Android SDK Platform Tools:
+
+```powershell
+.\adb.exe connect 192.168.43.1:5555
+.\adb.exe -s 192.168.43.1:5555 install -r "C:\path\to\ftc-run-health\TeamCode\build\outputs\apk\debug\TeamCode-debug.apk"
+```
+
+Expected result:
+
+```text
+connected to 192.168.43.1:5555
+Performing Streamed Install
+Success
+```
+
+Verified example from this project:
+
+```powershell
+Set-Location C:\Users\victo\AppData\Local\Android\Sdk\platform-tools
+.\adb.exe connect 192.168.43.1:5555
+.\adb.exe -s 192.168.43.1:5555 install -r "C:\Users\victo\Documents\ftc-run-health\TeamCode\build\outputs\apk\debug\TeamCode-debug.apk"
+```
+
+Keep `-s 192.168.43.1:5555` when more than one Android device is connected.
+
+## Add Run Health To A LinearOpMode
+
+Edit the LinearOpMode in `TeamCode`, not an official template. Do not rename hardware devices or change controls. Add only the session lifecycle and an explicit map from existing motor objects to existing FTC configuration names.
+
+```java
+import org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthSession;
+
+import java.util.HashMap;
+import java.util.Map;
+
+// After existing hardwareMap.get(...) calls:
+Map<DcMotorEx, String> runHealthMotors = new HashMap<>();
+runHealthMotors.put(leftDrive, "left_drive");
+runHealthMotors.put(rightDrive, "right_drive");
+
+RunHealthSession runHealth =
+        RunHealthSession.start(hardwareMap, this, runHealthMotors);
+
+waitForStart();
+
+try {
+    while (opModeIsActive()) {
+        // Existing controls and motor commands remain unchanged.
+        runHealth.capture();
+    }
+} finally {
+    runHealth.finish();
+}
+```
+
+Use the exact names already present in the Driver Station robot configuration. The FTC SDK does not provide a reliable reverse lookup from every motor object to its configured name.
+
+See `TeamCode/src/main/java/org/firstinspires/ftc/teamcode/BasicOpMode_Linear.java` for the integrated example.
+
+## Recording Workflow
+
+1. Install the APK and join Control Hub Wi-Fi.
+2. Keep the dashboard open in Chrome at `/runhealth/`.
+3. Open **Saved Runs** and select **Save Next Run** or **Save Every Run**.
+4. Start an integrated OpMode and operate the robot normally.
+5. Stop the OpMode. `finish()` writes the completed recording on the Hub.
+6. The browser detects the run and starts a download to its configured Downloads location.
+7. If Chrome blocks automatic downloads, allow them for `192.168.43.1` or press **Download**.
+8. Wait for **Ready** before using Compare, Replay, Channels, or Trends.
+
+The dashboard tab must remain open and connected for automatic computer downloads. Hub recordings remain available from Saved Runs if the browser was closed or disconnected.
+
+## Data And Analysis Summary
+
+Each sample can contain commanded power, encoder velocity, motor current, motor mode, and battery voltage. Missing data remains unavailable and is never converted to zero.
+
+- Low power: `0.15 <= |power| < 0.35`
+- Medium power: `0.35 <= |power| < 0.65`
+- High power: `0.65 <= |power| <= 1.00`
+- Minimum comparison count: 20 samples per run
+- Changed: absolute percentage change of at least 5%
+- Large change: absolute percentage change of at least 15%
+
+Important calculations:
+
+- Median speed: `median(|encoder velocity|)`
+- Effective command: `|power| * battery voltage / 12`
+- Response: `median(|velocity| / effective command)`
+- Current per movement: `median(current amps * 1000 / |velocity|)` for velocity of at least 50 ticks/s
+- Possible stall: percentage where `|power| > 0.20` and `|velocity| < 50 ticks/s`
+
+Wear analysis matches 0.1-wide power bands before comparing response. It reports possibilities such as friction, binding, load, battery differences, wiring issues, encoder problems, or intentional holding. It does not prove a root cause.
+
+## Recording Files
+
+Current recordings may contain three same-stem files:
+
+```text
+<run-id>.csv
+<run-id>.manifest.json
+<run-id>.channels.csv
+```
+
+The motor CSV is required. The manifest contains metadata. The channels CSV contains optional custom telemetry and events. Select all companions together for offline import. Legacy motor-only CSV remains supported.
+
+## Safety And Privacy
+
+- Sampling uses getter methods only.
+- `capture()` catches failures so logging should not terminate the OpMode.
+- One failing motor does not prevent other motors from being sampled.
+- Sampling is capped at 10 Hz and 5,400 samples per motor.
+- No file I/O occurs inside `capture()`; files are written by `finish()`.
+- HTTP file access is confined to Run Health storage and sanitized run IDs.
+- Imported files are parsed locally and are not uploaded to a cloud service.
+- The dashboard is available to devices on the robot network; protect that Wi-Fi as trusted team infrastructure.
+
+## Documentation
+
+- [New User Guide](docs/NEW_USER_GUIDE.md): setup, integration, daily use, diagnosis, files, and troubleshooting.
+- The Word technical manual is distributed separately from this repository to avoid committing generated binary documentation.
+
+## Tests
+
+```powershell
+Set-Location viewer
+npm test
+npm run build
+Set-Location ..
+.\gradlew.bat :TeamCode:clean :TeamCode:testDebugUnitTest :TeamCode:assembleDebug
+```
+
+## Project Boundary
+
+FTC Run Health is a diagnostic aid, not a safety controller or certified predictor of motor failure. Use trends from repeatable tests, verify warnings physically, and stop immediately if the robot binds, overheats, smells unusual, damages wiring, or behaves unsafely.
+
+The repository retains official FIRST FTC SDK source, sample documentation, notices, and license material from the upstream project.
+
+---
+
+# Official FIRST FTC SDK README
+
 ## NOTICE
 
 This repository contains the public FTC SDK for the DECODE (2025-2026) competition season.

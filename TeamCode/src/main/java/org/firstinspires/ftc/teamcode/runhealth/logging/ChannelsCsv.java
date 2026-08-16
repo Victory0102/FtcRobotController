@@ -227,7 +227,7 @@ public final class ChannelsCsv {
      * Used by unit tests as a clean Locale.US formatter.  Integer-valued
      * doubles receive one fractional digit ({@code "0.0"} for {@code 0.0d});
      * non-integers receive six ({@code "1.500000"} for {@code 1.5d}).  This
-     * matches the documented {@code CSV_SCHEMA.md} contract for the
+     * matches the documented channels schema contract for the
      * channels CSV.
      */
     public static String localeUS(double v) {

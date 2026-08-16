@@ -62,7 +62,7 @@ public class EndToEndApiSmokeTest {
         Assume.assumeFalse(
                 "EndToEndApiSmokeTest skipped on Windows: Files.createTempDirectory "
                         + "mounting under a junction is incompatible with the production "
-                        + "isWithinDirectory canonical-prefix check. See docs/TROUBLESHOOTING.md.",
+                        + "isWithinDirectory canonical-prefix check. See docs/NEW_USER_GUIDE.md.",
                 isWindows);
         File raw = Files.createTempDirectory("runhealth-e2e-").toFile();
         // Canonicalise so any subsequent within-directory checks anchor to

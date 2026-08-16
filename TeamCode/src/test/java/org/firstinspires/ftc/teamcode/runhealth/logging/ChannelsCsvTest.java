@@ -112,7 +112,7 @@ public class ChannelsCsvTest {
         assertEquals("", ChannelsCsv.formatNumber(Double.NaN));
         assertEquals("", ChannelsCsv.formatNumber(Double.POSITIVE_INFINITY));
         assertEquals("", ChannelsCsv.formatNumber(Double.NEGATIVE_INFINITY));
-        // Per CSV_SCHEMA.md the formatter caps precision at 6 fractional
+        // The channels schema caps precision at 6 fractional
         // digits.  Integer-valued doubles get one fractional digit; the rest
         // get six.  This locks in the documented behaviour so the test
         // fails the day someone tightens it.

@@ -296,7 +296,7 @@ public final class RunHealthApi {
      * Returns the most-recent bounded read-only live snapshot, or an
      * empty inactive snapshot when no session has run yet.  GET only by
      * design (other methods return 405 at the router).  Response shape
-     * is documented in docs/LIVE_VIEW.md.
+     * is documented in docs/NEW_USER_GUIDE.md and the technical manual.
      *
      * <p>Response cap: when the encoded body would exceed the maximum
      * inlined response size we still emit a complete snapshot; the router
