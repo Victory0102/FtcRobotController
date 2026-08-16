@@ -136,7 +136,6 @@ export class LivePoller {
 export interface LiveMotorSlice {
   deviceName: string;
   powerHistory: Array<{ t: number; v: number | null }>;
-  positionHistory: Array<{ t: number; v: number | null }>;
   velocityHistory: Array<{ t: number; v: number | null }>;
   currentHistory: Array<{ t: number; v: number | null }>;
   batteryHistory: Array<{ t: number; v: number | null }>;
@@ -230,12 +229,10 @@ export class LiveStore {
         if (!mv || typeof mv.device_name !== 'string') continue;
         const slice = this.ensureMotor(mv.device_name);
         slice.powerHistory.push({ t: now, v: mv.power ?? null });
-        slice.positionHistory.push({ t: now, v: mv.position_ticks ?? null });
         slice.velocityHistory.push({ t: now, v: mv.velocity_ticks_per_second ?? null });
         slice.currentHistory.push({ t: now, v: mv.current_amps ?? null });
         if (mv.mode != null) slice.mode = mv.mode;
         this.trimByWindow(slice.powerHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
-        this.trimByWindow(slice.positionHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
         this.trimByWindow(slice.velocityHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
         this.trimByWindow(slice.currentHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
       }
@@ -360,12 +357,12 @@ export class LiveStore {
 
   /** Names of every motor ever observed, deduped.  O(N) scan. */
   getMotorNames(): string[] {
-    return Array.from(this.motorHistoryByName.keys());
+    return Array.from(this.motorHistoryByName.keys()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
   }
 
   /** Names of every channel ever observed, in insertion order. */
   getChannelNames(): string[] {
-    return Array.from(this.channelHistoryByName.keys());
+    return Array.from(this.channelHistoryByName.keys()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
   }
 
   private ensureMotor(name: string): LiveMotorSlice {
@@ -374,7 +371,6 @@ export class LiveStore {
       s = {
         deviceName: name,
         powerHistory: [],
-        positionHistory: [],
         velocityHistory: [],
         currentHistory: [],
         batteryHistory: [],

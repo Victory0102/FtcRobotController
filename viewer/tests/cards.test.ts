@@ -140,7 +140,7 @@ describe('buildLiveSummaryChips', () => {
 /* ================================================================== */
 
 describe('buildMotorCardDescriptors', () => {
-  it('emits metrics in canonical order Power, Position, Velocity, Current', () => {
+  it('emits focused motor-performance metrics without position', () => {
     const store = fakeStore({
       motors: [{
         name: 'frontLeft',
@@ -165,10 +165,10 @@ describe('buildMotorCardDescriptors', () => {
     expect(cards[0].deviceName).toBe('frontLeft');
     expect(cards[0].mode).toBe('RUN_USING_ENCODER');
     expect(cards[0].metricRows.map((r) => r.label)).toEqual([
-      'Power', 'Position', 'Velocity', 'Current',
+      'Power', 'Velocity', 'Current',
     ]);
-    // Power has 0.62 -> formatted via formatPower -> "0.62".
-    expect(cards[0].metricRows[0].value).toBe('0.62');
+    // Histories are chronological, so the card displays the newest sample.
+    expect(cards[0].metricRows[0].value).toBe('0.61');
     expect(cards[0].metricRows[1].value).toMatch(/ticks/);
     expect(cards[0].metricRows[0].tone).toBe('normal');
   });

@@ -135,68 +135,70 @@ export function parseUnifiedRun(input) {
  *  - File-size cap (MAX_INPUT_BYTES), row cap (MAX_ROWS)
  */
 export function parseRunHealthCsv(input, fileName) {
-    // 1. Input validation.
     const guard = guardInput(input, fileName);
     if (guard)
         return guard;
-    const rows = splitCsv(input);
-    if (rows.length === 0) {
-        return { kind: 'error', reason: 'Empty file' };
-    }
-    if (rows.length > MAX_ROWS) {
-        return {
-            kind: 'error',
-            reason: 'Too many rows',
-            detail: `Row count ${rows.length} exceeds ${MAX_ROWS}.`,
-        };
-    }
-    // 2. Header validation.
-    const header = rows[0];
-    const headerCheck = validateHeader(header);
-    if (!headerCheck.ok)
-        return headerCheck;
-    // 3. Schema-version capability check (read from first data row column 0).
-    const schemaVersion = rows.length > 1 ? (rows[1][0] ?? '') : '';
-    if (isFutureSchema(schemaVersion)) {
-        return {
-            kind: 'error',
-            reason: 'Unsupported schema version',
-            detail: `schema_version=${schemaVersion} is newer than supported ${SCHEMA_VERSION}.`,
-        };
-    }
     const colIdx = {};
     for (let i = 0; i < EXPECTED_COLUMNS.length; i++) {
         colIdx[EXPECTED_COLUMNS[i]] = i;
     }
-    // 4. Sample assembly.
     const samples = [];
     let invalidRowCount = 0;
     let truncated = false;
     let runId = '';
     let opmodeName = '';
     let runStartedAt = '';
+    let schemaVersion = '';
+    let rowCount = 0;
+    let headerSeen = false;
+    let parseError = null;
     const deviceSet = new Set();
-    const MAX_SAMPLES_PER_RUN = 250000; // defensive; matches MAX_ROWS
-    for (let i = 1; i < rows.length; i++) {
-        if (samples.length >= MAX_SAMPLES_PER_RUN) {
-            invalidRowCount++;
-            continue;
+    visitCsvRows(input, (r, index) => {
+        rowCount++;
+        if (rowCount > MAX_ROWS) {
+            parseError = {
+                kind: 'error',
+                reason: 'Too many rows',
+                detail: `Row count exceeds ${MAX_ROWS}.`,
+            };
+            return false;
         }
-        const r = rows[i];
-        if (r.length === 0 || (r.length === 1 && r[0] === ''))
-            continue;
+        if (index === 0) {
+            headerSeen = true;
+            const headerCheck = validateHeader(r);
+            if (!headerCheck.ok) {
+                parseError = headerCheck;
+                return false;
+            }
+            return true;
+        }
+        if (index === 1) {
+            schemaVersion = r[0] ?? '';
+            if (isFutureSchema(schemaVersion)) {
+                parseError = {
+                    kind: 'error',
+                    reason: 'Unsupported schema version',
+                    detail: `schema_version=${schemaVersion} is newer than supported ${SCHEMA_VERSION}.`,
+                };
+                return false;
+            }
+        }
+        if (samples.length >= MAX_ROWS) {
+            invalidRowCount++;
+            return true;
+        }
         if (r.length < EXPECTED_COLUMNS.length) {
             invalidRowCount++;
-            continue;
+            return true;
         }
         const sample = rowToSample(r, colIdx);
         if (sample === null) {
             invalidRowCount++;
-            continue;
+            return true;
         }
         if (sample.deviceName === '__RUN_HEALTH_TRUNCATED__') {
             truncated = true;
-            continue;
+            return true;
         }
         if (runId === '' && sample.runId)
             runId = sample.runId;
@@ -207,7 +209,12 @@ export function parseRunHealthCsv(input, fileName) {
         if (sample.deviceName)
             deviceSet.add(sample.deviceName);
         samples.push(sample);
-    }
+        return true;
+    });
+    if (parseError)
+        return parseError;
+    if (!headerSeen)
+        return { kind: 'error', reason: 'Empty file' };
     if (samples.length === 0 && invalidRowCount === 0 && !truncated) {
         return { kind: 'error', reason: 'No samples', detail: 'CSV had no data rows.' };
     }
@@ -621,12 +628,23 @@ export function sanitizeText(s) {
         out = out.slice(0, MAX_TEXT_LEN);
     return out;
 }
-// ---------------- RFC 4180 splitter ----------------
-function splitCsv(input) {
-    const rows = [];
+// ---------------- RFC 4180 row reader ----------------
+function visitCsvRows(input, visit) {
     let cur = [];
     let fieldBuf = [];
     let inQuotes = false;
+    let rowIndex = 0;
+    const emit = () => {
+        cur.push(fieldBuf.join(''));
+        fieldBuf = [];
+        if (!(cur.length === 1 && cur[0] === '')) {
+            const keepGoing = visit(cur, rowIndex++);
+            cur = [];
+            return keepGoing;
+        }
+        cur = [];
+        return true;
+    };
     for (let i = 0; i < input.length; i++) {
         const c = input.charAt(i);
         if (inQuotes) {
@@ -654,30 +672,29 @@ function splitCsv(input) {
             continue;
         }
         if (c === '\r') {
-            cur.push(fieldBuf.join(''));
-            fieldBuf = [];
-            if (!(cur.length === 1 && cur[0] === ''))
-                rows.push(cur);
-            cur = [];
+            if (!emit())
+                return;
             if (i + 1 < input.length && input.charAt(i + 1) === '\n')
                 i++;
             continue;
         }
         if (c === '\n') {
-            cur.push(fieldBuf.join(''));
-            fieldBuf = [];
-            if (!(cur.length === 1 && cur[0] === ''))
-                rows.push(cur);
-            cur = [];
+            if (!emit())
+                return;
             continue;
         }
         fieldBuf.push(c);
     }
     if (fieldBuf.length > 0 || cur.length > 0) {
-        cur.push(fieldBuf.join(''));
-        if (!(cur.length === 1 && cur[0] === ''))
-            rows.push(cur);
+        emit();
     }
+}
+function splitCsv(input) {
+    const rows = [];
+    visitCsvRows(input, (row) => {
+        rows.push(row);
+        return true;
+    });
     return rows;
 }
 /** Detects duplicate run_id among already-parsed runs. */

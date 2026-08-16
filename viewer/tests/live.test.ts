@@ -203,8 +203,8 @@ describe('LiveStore trim and dedup', () => {
     const withMotors = (seq: number) => ({
       ...snap(seq),
       motors: [
-        { device_name: 'left', power: 0.3, position_ticks: null, velocity_ticks_per_second: null, current_amps: null, mode: 'RUN_USING_ENCODER' },
-        { device_name: 'right', power: -0.2, position_ticks: null, velocity_ticks_per_second: null, current_amps: null, mode: 'RUN_USING_ENCODER' },
+        { device_name: 'left', power: 0.3, velocity_ticks_per_second: null, current_amps: null, mode: 'RUN_USING_ENCODER' },
+        { device_name: 'right', power: -0.2, velocity_ticks_per_second: null, current_amps: null, mode: 'RUN_USING_ENCODER' },
       ],
     });
     s.apply(withMotors(1));

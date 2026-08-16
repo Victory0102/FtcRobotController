@@ -16,8 +16,6 @@ org.firstinspires.ftc.teamcode.runhealth.logging.{RunHealthSession,
   BatteryVoltageReader, RunHealthConfig, RunStorage}
 org.firstinspires.ftc.teamcode.runhealth.api.{RunHealthApi,
   RunHealthWeb}
-org.firstinspires.ftc.teamcode.runhealth.examples.{ExampleLinearOpMode,
-  ExampleIterativeOpMode}
 ```
 
 Copy the bundled UI into your team's assets folder:
@@ -94,8 +92,8 @@ try {
 }
 ```
 
-For a complete example see
-`teamcode/runhealth/examples/ExampleLinearOpMode.java`.
+For the installed linear example, see
+`TeamCode/src/main/java/org/firstinspires/ftc/teamcode/BasicOpMode_Linear.java`.
 
 ## 7. Recording mode
 

@@ -102,7 +102,6 @@ public final class LiveSnapshot {
             Map<String, Object> j = new LinkedHashMap<>();
             j.put("device_name", mv.deviceName);
             j.put("power", mv.power);
-            j.put("position_ticks", mv.position);
             j.put("velocity_ticks_per_second", mv.velocity);
             j.put("current_amps", mv.currentAmps);
             j.put("mode", mv.mode);
@@ -189,16 +188,14 @@ public final class LiveSnapshot {
     public static final class MotorView {
         public final String deviceName;
         public final Double power;
-        public final Long position;
         public final Double velocity;
         public final Double currentAmps;
         public final String mode;
 
-        public MotorView(String deviceName, Double power, Long position,
-                         Double velocity, Double currentAmps, String mode) {
+        public MotorView(String deviceName, Double power, Double velocity,
+                         Double currentAmps, String mode) {
             this.deviceName = deviceName;
             this.power = power;
-            this.position = position;
             this.velocity = velocity;
             this.currentAmps = currentAmps;
             this.mode = mode;

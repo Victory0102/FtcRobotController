@@ -129,13 +129,13 @@ describe('defaultColor palette does not repeat sooner than 8', () => {
   });
 });
 
-describe('motorMetricSeries produces the 5 metric series', () => {
-  it('emits power, position, velocity, current', () => {
+describe('motorMetricSeries produces motor-performance series', () => {
+  it('emits power, velocity, and current without position', () => {
     const samples = [s(0, 0.5, 2000, 1.0), s(100, 0.6, 2100, 1.1)];
     const series = motorMetricSeries('m1', samples, 0);
-    expect(series.length).toBe(4);
+    expect(series.length).toBe(3);
     expect(series.map((s) => s.id)).toEqual([
-      'm1.power', 'm1.position', 'm1.velocity', 'm1.current',
+      'm1.power', 'm1.velocity', 'm1.current',
     ]);
   });
 });

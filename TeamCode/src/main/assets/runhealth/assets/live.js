@@ -165,13 +165,11 @@ export class LiveStore {
                     continue;
                 const slice = this.ensureMotor(mv.device_name);
                 slice.powerHistory.push({ t: now, v: mv.power ?? null });
-                slice.positionHistory.push({ t: now, v: mv.position_ticks ?? null });
                 slice.velocityHistory.push({ t: now, v: mv.velocity_ticks_per_second ?? null });
                 slice.currentHistory.push({ t: now, v: mv.current_amps ?? null });
                 if (mv.mode != null)
                     slice.mode = mv.mode;
                 this.trimByWindow(slice.powerHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
-                this.trimByWindow(slice.positionHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
                 this.trimByWindow(slice.velocityHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
                 this.trimByWindow(slice.currentHistory, now, LIVE_LIMITS.MAX_POINTS_PER_GRAPH);
             }
@@ -293,11 +291,11 @@ export class LiveStore {
     }
     /** Names of every motor ever observed, deduped.  O(N) scan. */
     getMotorNames() {
-        return Array.from(this.motorHistoryByName.keys());
+        return Array.from(this.motorHistoryByName.keys()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
     }
     /** Names of every channel ever observed, in insertion order. */
     getChannelNames() {
-        return Array.from(this.channelHistoryByName.keys());
+        return Array.from(this.channelHistoryByName.keys()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
     }
     ensureMotor(name) {
         let s = this.motorHistoryByName.get(name);
@@ -305,7 +303,6 @@ export class LiveStore {
             s = {
                 deviceName: name,
                 powerHistory: [],
-                positionHistory: [],
                 velocityHistory: [],
                 currentHistory: [],
                 batteryHistory: [],

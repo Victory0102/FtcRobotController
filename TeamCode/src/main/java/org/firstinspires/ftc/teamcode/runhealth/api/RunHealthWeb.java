@@ -6,235 +6,260 @@
  */
 package org.firstinspires.ftc.teamcode.runhealth.api;
 
+import android.content.Context;
+import android.content.res.AssetManager;
+
+import com.qualcomm.robotcore.util.WebHandlerManager;
+
 import org.firstinspires.ftc.ftccommon.external.WebHandlerRegistrar;
+import org.firstinspires.ftc.robotcore.internal.webserver.WebHandler;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 
-/**
- * Hooks Run Health into the FTC Robot Controller's web server via the
- * {@link org.firstinspires.ftc.ftccommon.external.WebHandlerRegistrar}
- * mechanism.  The companion class is scanned by the SDK at startup and
- * any method annotated with {@code @WebHandlerRegistrar} is invoked.
- *
- * <p>Strategy:
- * <ul>
- *   <li>The annotation target type is, in current FTC SDK, abstract.  The
- *       SDK calls our method reflecting on the first {@link WebHandlerRegistrar}
- *       method.  We declare the parameter type as {@code Object} so we do
- *       not need to import or compile-couple to the actual class.</li>
- *   <li>We then introspect the manager at runtime, find a
- *       {@code register(String, X)} method, infer X, and register a
- *       {@link Proxy} that intercepts every call and dispatches to
- *       {@link RunHealthApi}.</li>
- *   <li>If the SDK changes the WebHandler contract or the WebHandlerManager
- *       registration shape, the worst case is that Run Health routes are
- *       not registered; we log and continue.  The OpMode code is unaffected.</li>
- * </ul>
- *
- * <p>This file is intentionally reflection-heavy.  No setter on any device is
- * ever reached from here, so safety properties are unaffected.
- */
+import fi.iki.elonen.NanoHTTPD;
+
+/** Hooks Run Health into the FTC Robot Controller web server and serves the
+ * bundled SPA plus JSON API from the APK assets. */
 public final class RunHealthWeb {
+
+    private static final String ASSET_INDEX = "runhealth/index.html";
+    // Keep inline responses comfortably below the APK asset cap.
+    private static final int MAX_ASSET_BYTES = 8 * 1024 * 1024;
 
     private RunHealthWeb() { /* utility */ }
 
-    /**
-     * Register the Run Health HTTP routes with the FTC WebHandlerManager.
-     *
-     * <p>The signature is declared with {@code Object} so we do not need
-     * to depend on a specific {@link WebHandlerManager} type.  The runtime
-     * SDK calls this method via reflection with the actual manager instance.
-     */
     @WebHandlerRegistrar
-    public static void registerRunHealthRoutes(Object webHandlerManager) {
+    public static void registerRunHealthRoutes(Context context, WebHandlerManager webHandlerManager) {
         try {
-            registerSafely(webHandlerManager);
+            RunHealthWebHandler handler = new RunHealthWebHandler(context);
+            for (String path : MOUNT_PATHS) {
+                webHandlerManager.register(path, handler);
+            }
+            int assetRoutes = 0;
+            String[] bundledAssets = context.getApplicationContext().getAssets()
+                    .list("runhealth/assets");
+            if (bundledAssets != null) {
+                for (String name : bundledAssets) {
+                    if (name == null || name.isEmpty()) continue;
+                    webHandlerManager.register("/runhealth/assets/" + name, handler);
+                    assetRoutes++;
+                }
+            }
+            System.out.println("[RunHealthWeb] Registered "
+                    + (MOUNT_PATHS.length + assetRoutes) + " Run Health routes.");
         } catch (Throwable t) {
             // Never propagate; the OpMode must continue even if registration fails.
             System.err.println("[RunHealthWeb] Registration failed: " + t);
         }
     }
 
-    private static void registerSafely(Object manager) throws Exception {
-        if (manager == null) return;
-        // Look up the WebHandlerManager.register(String, X) method, where X
-        // may be a concrete WebHandler class, an interface, or an abstract
-        // class depending on the SDK version.
-        Method register = findRegister(manager.getClass());
-        if (register == null) {
-            System.err.println("[RunHealthWeb] No register(String,?) on " + manager.getClass().getName());
-            return;
-        }
-        Class<?> handlerType = register.getParameterTypes()[1];
-        Object dispatcher = Proxy.newProxyInstance(
-                handlerType.getClassLoader(),
-                new Class<?>[] { handlerType },
-                new DispatcherInvocationHandler());
-
-        // Top-level prefix that handles index.html and unmapped /
-        final String[] paths = {
-                "/runhealth/",
-                "/runhealth/index.html",
-                "/runhealth/api/recording",
-                "/runhealth/api/baseline",
-                "/runhealth/api/runs",
-                "/runhealth/api/live/snapshot",
-                "/runhealth/assets/",
-        };
-        for (String p : paths) {
-            try {
-                register.invoke(manager, p, dispatcher);
-            } catch (Throwable t) {
-                System.err.println("[RunHealthWeb] Could not register " + p + ": " + t);
-            }
-        }
-        // Tell the user we're set up.
-        System.out.println("[RunHealthWeb] Registered " + paths.length + " Run Health routes.");
-    }
-
-    private static Method findRegister(Class<?> cls) {
-        for (Method m : cls.getMethods()) {
-            if (!"register".equals(m.getName())) continue;
-            if (m.getParameterCount() != 2) continue;
-            Class<?>[] pt = m.getParameterTypes();
-            if (pt[0] != String.class) continue;
-            return m;
-        }
-        return null;
-    }
+    // Exact URIs the viewer requests.
+    private static final String[] MOUNT_PATHS = {
+            "/runhealth",                            // bare mount -> 301 to /runhealth/
+            "/runhealth/",                           // index page
+            "/runhealth/index.html",
+            "/runhealth/styles.css",
+            "/runhealth/manifest.json",
+            "/runhealth/api/live/snapshot",
+            "/runhealth/api/recording",
+            "/runhealth/api/baseline",
+            "/runhealth/api/runs",
+            "/runhealth/api/runs/download-selected",
+            "/runhealth/api/runs/delete-selected",
+    };
 
     /**
-     * Adapter proxy that translates the SDK's WebHandler call shape into
-     * a {@link RunHealthApi.ApiRequest}.  All response shapes are also
-     * reflected so we stay independent of the concrete SDK types.
+     * Serves the Run Health SPA entry page and the JSON API.  One instance
+     * is shared by every registered path (the web server is multi-threaded,
+     * so the handler must be stateless apart from thread-safe members).
      */
-    private static final class DispatcherInvocationHandler implements InvocationHandler {
+    private static final class RunHealthWebHandler implements WebHandler {
 
-        private final RunHealthApi api = new RunHealthApi();
+        private final AssetManager assets;
+        private RunHealthApi api;
+
+        RunHealthWebHandler(Context context) {
+            this.assets = context.getApplicationContext().getAssets();
+        }
+
+        // Lazy because the registrar can run before storage is ready.
+        private RunHealthApi api() {
+            RunHealthApi a = api;
+            if (a == null) {
+                api = a = new RunHealthApi();
+            }
+            return a;
+        }
 
         @Override
-        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            String name = method.getName();
-            // JDK-injected Object methods: handle gracefully.
-            if ("hashCode".equals(name)) return System.identityHashCode(proxy);
-            if ("equals".equals(name))   return proxy == args[0];
-            if ("toString".equals(name)) return "RunHealthDispatcher";
-            // The web server invokes the actual handler method.
-            if (args != null && args.length >= 1 && args[0] != null) {
-                return dispatch(method, args, proxy);
+        public NanoHTTPD.Response getResponse(NanoHTTPD.IHTTPSession session)
+                throws IOException, NanoHTTPD.ResponseException {
+            final String uri = session.getUri();
+            if (uri == null) {
+                return notFound();
             }
-            // No request argument: legacy shapes like handle() with no args.
-            // Fall back to a 405 response when we cannot infer a request.
-            return null;
+            if (uri.equals("/runhealth")) {
+                return redirect("/runhealth/");
+            }
+            String rel = relative(uri);
+            if (rel.isEmpty() || rel.equals("index.html")) {
+                return servePage();
+            }
+            if (rel.equals("styles.css")) {
+                return serveAsset("runhealth/styles.css", "text/css; charset=utf-8");
+            }
+            if (rel.equals("manifest.json")) {
+                return serveAsset("runhealth/manifest.json", "application/json; charset=utf-8");
+            }
+            if (rel.startsWith("assets/") && isSafeAssetPath(rel)) {
+                return serveAsset("runhealth/" + rel, mimeTypeFor(rel));
+            }
+            if (rel.startsWith("api/")) {
+                return serveApi(session, "/" + rel);
+            }
+            return notFound();
         }
 
-        private Object dispatch(Method method, Object[] args, Object proxy) throws Exception {
-            Object req = args[0];
-            String methodName = method.getName();
-            String httpMethod = "GET";
-            String path = "/";
-            String body = "";
+        private static boolean isSafeAssetPath(String rel) {
+            return rel.indexOf("..") < 0
+                    && rel.indexOf('\\') < 0
+                    && rel.matches("assets/[A-Za-z0-9_.-]+");
+        }
 
-            String m1 = (String) readField(req, "method");
-            if (m1 != null) httpMethod = m1;
-            String p1 = (String) readField(req, "uri");
-            if (p1 == null) p1 = (String) readField(req, "path");
-            if (p1 != null) path = p1;
-            String b1 = (String) readField(req, "body");
-            if (b1 == null) b1 = "";
-            body = b1;
+        private static String mimeTypeFor(String path) {
+            if (path.endsWith(".js")) return "text/javascript; charset=utf-8";
+            if (path.endsWith(".css")) return "text/css; charset=utf-8";
+            if (path.endsWith(".json") || path.endsWith(".map")) {
+                return "application/json; charset=utf-8";
+            }
+            return "application/octet-stream";
+        }
 
-            // Strip query string from the path so the API matches by path only.
-            int q = path.indexOf('?');
-            String plainPath = q >= 0 ? path.substring(0, q) : path;
+        private static String relative(String uri) {
+            String p = uri;
+            while (p.startsWith("/")) {
+                p = p.substring(1);
+            }
+            if (p.equals("runhealth") || p.equals("runhealth/")) return "";
+            if (p.startsWith("runhealth/")) return p.substring("runhealth/".length());
+            return p;
+        }
 
-            RunHealthApi.ApiRequest apiReq = new RunHealthApi.ApiRequest(
-                    httpMethod, plainPath, body, null);
-            RunHealthApi.ApiResponse resp = api.handle(apiReq);
+        private NanoHTTPD.Response servePage() {
+            return serveAsset(ASSET_INDEX, "text/html; charset=utf-8");
+        }
 
-            // Convert our ApiResponse into whatever the SDK expects. The
-            // modern Shape is handle(...) returning a WebHandlerResponse with
-            // a body() byte[].  Older shapes return String.  We try the
-            // byte[] form first, then String, then fall back to a generic
-            // method-returning-null.
-            Object sdkResponse = null;
-
-            try {
-                Class<?> respCls = method.getReturnType();
-                if (respCls == void.class) {
-                    // Some SDK shapes are void; write to a side channel.
-                    return null;
+        private NanoHTTPD.Response serveAsset(String assetPath, String mimeType) {
+            try (InputStream in = assets.open(assetPath)) {
+                byte[] data = readFully(in, MAX_ASSET_BYTES);
+                NanoHTTPD.Response response = NanoHTTPD.newFixedLengthResponse(
+                        NanoHTTPD.Response.Status.OK, mimeType,
+                        new ByteArrayInputStream(data), data.length);
+                // APK updates must take effect without asking teams to clear a
+                // laptop browser cache. The bundle is local and small, so
+                // freshness is more valuable than asset caching here.
+                response.addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+                response.addHeader("Pragma", "no-cache");
+                return response;
+            } catch (IOException e) {
+                // Keep the page responsive if the bundle is missing.
+                if (ASSET_INDEX.equals(assetPath)) {
+                    return toResponse(api().handle(
+                            new RunHealthApi.ApiRequest("GET", "/", "", null)));
                 }
-                String ctor = findCtor(respCls, byte[].class, String.class);
-                if (ctor != null) {
-                    sdkResponse = respCls.getConstructor(byte[].class, String.class)
-                            .newInstance(resp.body, resp.contentType);
-                } else {
-                    String strCtor = findCtor(respCls, String.class);
-                    if (strCtor != null) {
-                        sdkResponse = respCls.getConstructor(String.class)
-                                .newInstance(new String(resp.body,
-                                        java.nio.charset.StandardCharsets.UTF_8));
+                return notFound();
+            }
+        }
+
+        private NanoHTTPD.Response serveApi(NanoHTTPD.IHTTPSession session, String path)
+                throws IOException, NanoHTTPD.ResponseException {
+            String method = session.getMethod() == null ? "GET" : session.getMethod().name();
+            // NanoHTTPD body parsing is only valid for methods that can carry
+            // a body. Calling parseBody() for GET can wait for bytes that will
+            // never arrive on some Control Hub/Chrome combinations.
+            String body = ("POST".equals(method) || "PUT".equals(method)
+                    || "PATCH".equals(method)) ? readBody(session) : "";
+            RunHealthApi.ApiRequest req = new RunHealthApi.ApiRequest(
+                    method, path, body, firstValues(session.getParameters()));
+            return toResponse(api().handle(req));
+        }
+
+        private static Map<String, String> firstValues(Map<String, java.util.List<String>> multi) {
+            Map<String, String> out = new HashMap<>();
+            if (multi == null) return out;
+            for (Map.Entry<String, java.util.List<String>> e : multi.entrySet()) {
+                java.util.List<String> v = e.getValue();
+                if (v != null && !v.isEmpty()) out.put(e.getKey(), v.get(0));
+            }
+            return out;
+        }
+
+        // Read the request body from NanoHTTPD's parsed temp data.
+        private static String readBody(NanoHTTPD.IHTTPSession session) {
+            try {
+                Map<String, String> files = new HashMap<>();
+                session.parseBody(files);
+                String postData = files.get("postData");
+                if (postData != null) return postData;
+                String content = files.get("content");
+                if (content != null && !content.isEmpty()) {
+                    try (InputStream in = new java.io.FileInputStream(
+                            new java.io.File(content))) {
+                        return new String(readFully(in, MAX_ASSET_BYTES), StandardCharsets.UTF_8);
                     }
                 }
+                return "";
             } catch (Throwable t) {
-                // Best-effort: fall back to null and rely on default page.
+                // Malformed or absent body: the API returns a structured error.
+                return "";
             }
-
-            // Also try to inject our HTTP status code via reflection if
-            // a setter exists (required for newer SDK shapes).
-            if (sdkResponse != null && resp.status != 200) {
-                trySetStatus(sdkResponse, resp.status);
-            }
-            return sdkResponse;
         }
 
-        private static void trySetStatus(Object obj, int status) {
-            try {
-                Method set = obj.getClass().getMethod("setStatus", int.class);
-                set.invoke(obj, status);
-            } catch (Throwable ignored) { /* SDK shape doesn't expose setStatus */ }
+        private static NanoHTTPD.Response toResponse(RunHealthApi.ApiResponse resp) {
+            NanoHTTPD.Response.Status status = NanoHTTPD.Response.Status.lookup(resp.status);
+            if (status == null) {
+                status = NanoHTTPD.Response.Status.INTERNAL_ERROR;
+            }
+            byte[] body = resp.body == null ? new byte[0] : resp.body;
+            String mime = resp.contentType == null ? "text/plain; charset=utf-8" : resp.contentType;
+            NanoHTTPD.Response out = NanoHTTPD.newFixedLengthResponse(
+                    status, mime, new ByteArrayInputStream(body), body.length);
+            for (Map.Entry<String, String> h : resp.headers.entrySet()) {
+                out.addHeader(h.getKey(), h.getValue());
+            }
+            return out;
         }
 
-        private static String findCtor(Class<?> cls, Class<?>... desired) {
-            for (java.lang.reflect.Constructor<?> c : cls.getConstructors()) {
-                Class<?>[] pt = c.getParameterTypes();
-                if (pt.length != desired.length) continue;
-                boolean match = true;
-                for (int i = 0; i < pt.length; i++) {
-                    if (!pt[i].isAssignableFrom(desired[i])) { match = false; break; }
+        private static NanoHTTPD.Response redirect(String location) {
+            NanoHTTPD.Response r = NanoHTTPD.newFixedLengthResponse(
+                    NanoHTTPD.Response.Status.REDIRECT, "text/plain; charset=utf-8",
+                    "Moved Permanently");
+            r.addHeader("Location", location);
+            return r;
+        }
+
+        private static NanoHTTPD.Response notFound() {
+            return NanoHTTPD.newFixedLengthResponse(
+                    NanoHTTPD.Response.Status.NOT_FOUND, "text/plain; charset=utf-8",
+                    "Not Found");
+        }
+
+        private static byte[] readFully(InputStream in, int max) throws IOException {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                if (out.size() > max) {
+                    throw new IOException("asset exceeds size cap");
                 }
-                if (match) return c.getName();
             }
-            return null;
-        }
-
-        /** Reflectively reads a field by name; returns null if not present. */
-        private static Object readField(Object obj, String name) {
-            try {
-                Class<?> cls = obj.getClass();
-                while (cls != null && cls != Object.class) {
-                    try {
-                        java.lang.reflect.Field f = cls.getDeclaredField(name);
-                        f.setAccessible(true);
-                        return f.get(obj);
-                    } catch (NoSuchFieldException nse) {
-                        cls = cls.getSuperclass();
-                    }
-                }
-            } catch (Throwable ignored) {}
-            return null;
-        }
-
-        // Map of arg-class -> handler used to dispatch on modern SDK shapes.
-        // Currently unused; reserved if Future SDK shapes need explicit matching.
-        @SuppressWarnings("unused")
-        private static boolean isMainCall(Method m) {
-            String n = m.getName();
-            return "handle".equals(n) || "render".equals(n) || "service".equals(n)
-                    || "process".equals(n) || "doGet".equals(n) || "doPost".equals(n);
+            return out.toByteArray();
         }
     }
 }

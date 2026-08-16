@@ -70,6 +70,16 @@ public class LiveSnapshotRegistryTest {
     }
 
     @Test
+    public void publishAdvancesSequenceCounterForNextProducerSample() {
+        reg.publish(snap(reg.currentSequence() + 1L, true));
+        long first = reg.currentSequence();
+        reg.publish(snap(reg.currentSequence() + 1L, true));
+        long second = reg.currentSequence();
+        assertEquals(first + 1L, second);
+        assertEquals(second, reg.current().sequence);
+    }
+
+    @Test
     public void publishNullIsIgnored() {
         reg.publish(null);
         assertNull(reg.current());
@@ -198,7 +208,7 @@ public class LiveSnapshotRegistryTest {
                 .opMode("TeleOp")
                 .recordingMode("EVERY")
                 .addMotor(new LiveSnapshot.MotorView("frontLeft",
-                        0.6, 1234L, 1320.0, 2.1, "RUN_USING_ENCODER"))
+                        0.6, 1320.0, 2.1, "RUN_USING_ENCODER"))
                 .addChannel(new LiveSnapshot.ChannelView(
                         "robot.heading", "number", 91.4, null, null,
                         null, null, null, "degrees", "Drive", "Robot heading degrees"))

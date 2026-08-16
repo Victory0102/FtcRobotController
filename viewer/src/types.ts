@@ -356,7 +356,6 @@ export const POWER_BAND_DEFINITION: Record<PowerBand, string> = {
 export interface LiveMotorView {
   device_name: string;
   power: number | null;
-  position_ticks: number | null;
   velocity_ticks_per_second: number | null;
   current_amps: number | null;
   mode: string | null;
@@ -397,4 +396,3 @@ export interface LiveSnapshot {
   events: LiveEventView[];
   no_active_session?: boolean;
 }
-

@@ -21,15 +21,6 @@ android {
     packagingOptions {
         jniLibs.useLegacyPackaging true
     }
-
-    // Bundled Run Health UI assets are shipped under src/main/assets/runhealth/
-    // and copied into the APK and made available to the Robot Controller web
-    // server at /runhealth/assets/*
-    sourceSets {
-        main {
-            assets.srcDirs += file('src/main/assets/runhealth')
-        }
-    }
 }
 
 dependencies {

@@ -40,8 +40,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * <h2>Read-only contract</h2>
  *
  * This class MUST NOT write to any device, sensor, motor, hub, or OpMode
- * state.  Only reads of {@code getPower()}, {@code getCurrentPosition()},
- * {@code getVelocity()}, {@code getCurrent(CurrentUnit)}, and
+ * state.  Only reads of {@code getPower()}, {@code getVelocity()},
+ * {@code getCurrent(CurrentUnit)}, and
  * {@code getMode()} are permitted.  This class does not call any setter on
  * {@code DcMotorEx}.
  *
@@ -87,6 +87,7 @@ public final class RunHealthSession implements AutoCloseable {
     private final Object lock = new Object();
 
     private long lastCaptureAtMs = 0;
+    private Double latestLoopTimeMs = null;
     // Volatile so concurrent observers (rare but possible in some driver
     // stations) see consistent state across reads.
     private volatile boolean truncated = false;
@@ -158,7 +159,7 @@ public final class RunHealthSession implements AutoCloseable {
         this.runStartedAt = formatUtcIso(new Date());
         this.opmodeName = opmodeName(opmodeContextOrName);
 
-        this.motors = discoverMotors(hardwareMap);
+        this.motors = discoverMotors(hardwareMap, this.providedNames);
         this.motorCounts = new ArrayList<>(motors.size());
         for (int i = 0; i < motors.size(); i++) motorCounts.add(new int[]{0});
         this.runClock = new ElapsedTime(ElapsedTime.Resolution.MILLISECONDS);
@@ -279,6 +280,9 @@ public final class RunHealthSession implements AutoCloseable {
                 if (lastCaptureAtMs != 0 && now - lastCaptureAtMs < MIN_CAPTURE_INTERVAL_MS) {
                     return false; // rate-limited
                 }
+                if (lastCaptureAtMs != 0) {
+                    latestLoopTimeMs = Double.valueOf(now - lastCaptureAtMs);
+                }
                 lastCaptureAtMs = now;
 
                 Double batteryV = BatteryVoltageReader.read(hardwareMap);
@@ -353,16 +357,6 @@ public final class RunHealthSession implements AutoCloseable {
             if (finished) return;
             finished = true;
 
-            // Mark the live snapshot inactive so the browser sees the
-            // session as "finished" without affecting the durable recording
-            // or the recording-mode flag.  Wrapped to never throw — the
-            // OpMode has already written or skipped its CSV; this is purely
-            // a display signal.
-            try {
-                org.firstinspires.ftc.teamcode.runhealth.logging.LiveSnapshotRegistry
-                        .getInstance().markInactive();
-            } catch (Throwable tIgnored) { /* swallow */ }
-
             // If the OpMode never produced its first sample, release the NEXT
             // claim so the next call may still claim it.
             if (armedAndUnconsumed) {
@@ -372,11 +366,13 @@ public final class RunHealthSession implements AutoCloseable {
 
             if (storage == null) {
                 RobotLog.vv(TAG, "No-op session finished; no file written");
+                markLiveInactive();
                 return;
             }
             int total = totalSamples();
             if (total == 0 && committedSamples.isEmpty()) {
                 RobotLog.ii(TAG, "No samples captured; no file written for opmode=" + opmodeName);
+                markLiveInactive();
                 return;
             }
 
@@ -460,7 +456,19 @@ public final class RunHealthSession implements AutoCloseable {
                 }
             } catch (Throwable t) {
                 RobotLog.ee(TAG, t, "Failed to persist Run Health CSV");
+            } finally {
+                // The browser treats active -> inactive as the completion
+                // signal. Publish it only after all run files are visible.
+                markLiveInactive();
             }
+        }
+    }
+
+    private static void markLiveInactive() {
+        try {
+            LiveSnapshotRegistry.getInstance().markInactive();
+        } catch (Throwable ignored) {
+            // Diagnostics must never interfere with OpMode shutdown.
         }
     }
 
@@ -563,7 +571,8 @@ public final class RunHealthSession implements AutoCloseable {
                 .recordingMode(org.firstinspires.ftc.teamcode.runhealth.logging.RunHealthConfig.getRecordingMode())
                 .sequence(reg.currentSequence() + 1L)
                 .timestampMs(System.currentTimeMillis())
-                .elapsedMs(now);
+                .elapsedMs(now)
+                .loopTimeMs(latestLoopTimeMs);
 
         // Battery voltage — read this tick via BatteryVoltageReader.
         Double battV = null;
@@ -579,17 +588,12 @@ public final class RunHealthSession implements AutoCloseable {
             String name = providedNames.get(m);
             if (name == null || name.isEmpty()) name = "unknown";
             Double power = null;
-            Long position = null;
             Double velocity = null;
             Double amps = null;
             String mode = null;
             try {
                 double p = m.getPower();
                 if (Double.isFinite(p)) power = p;
-            } catch (Throwable ignored) { /* null */ }
-            try {
-                int p = m.getCurrentPosition();
-                position = (long) p;
             } catch (Throwable ignored) { /* null */ }
             try {
                 double v = m.getVelocity();
@@ -605,7 +609,7 @@ public final class RunHealthSession implements AutoCloseable {
                 com.qualcomm.robotcore.hardware.DcMotor.RunMode mm = m.getMode();
                 if (mm != null) mode = mm.toString();
             } catch (Throwable ignored) { /* null */ }
-            f.addMotor(new LiveSnapshot.MotorView(name, power, position, velocity, amps, mode));
+            f.addMotor(new LiveSnapshot.MotorView(name, power, velocity, amps, mode));
         }
 
         // Channels — emit the latest staged value per channel name so the
@@ -848,8 +852,28 @@ public final class RunHealthSession implements AutoCloseable {
 
     private int totalSamples() { return buffer.size(); }
 
-    private static List<DcMotorEx> discoverMotors(HardwareMap hardwareMap) {
+    private static List<DcMotorEx> discoverMotors(
+            HardwareMap hardwareMap,
+            java.util.Map<DcMotorEx, String> providedNames) {
         List<DcMotorEx> out = new ArrayList<>();
+        if (providedNames != null && !providedNames.isEmpty()) {
+            java.util.List<java.util.Map.Entry<DcMotorEx, String>> named =
+                    new java.util.ArrayList<>(providedNames.entrySet());
+            java.util.Collections.sort(named,
+                    new java.util.Comparator<java.util.Map.Entry<DcMotorEx, String>>() {
+                        @Override public int compare(
+                                java.util.Map.Entry<DcMotorEx, String> a,
+                                java.util.Map.Entry<DcMotorEx, String> b) {
+                            String an = a.getValue() == null ? "" : a.getValue();
+                            String bn = b.getValue() == null ? "" : b.getValue();
+                            return an.compareToIgnoreCase(bn);
+                        }
+                    });
+            for (java.util.Map.Entry<DcMotorEx, String> entry : named) {
+                if (entry.getKey() != null) out.add(entry.getKey());
+            }
+            return out;
+        }
         try {
             for (DcMotorEx ex : hardwareMap.getAll(DcMotorEx.class)) {
                 if (ex == null) continue;
@@ -874,12 +898,6 @@ public final class RunHealthSession implements AutoCloseable {
             Double power;
             try { power = motor.getPower(); }
             catch (Throwable t) { power = null; }
-
-            Long pos;
-            try {
-                int p = motor.getCurrentPosition();
-                pos = (long) p;
-            } catch (Throwable t) { pos = null; }
 
             Double vel;
             try { vel = motor.getVelocity(); }
@@ -906,7 +924,7 @@ public final class RunHealthSession implements AutoCloseable {
 
             return new MotorSample(
                     runId, opmodeName, runStartedAt, tMs, name,
-                    power, pos, vel, current, modeStr, batteryV);
+                    power, null, vel, current, modeStr, batteryV);
         } catch (Throwable t) {
             RobotLog.ww(TAG, "readOneMotor failed: " + t.getMessage());
             return null;
@@ -928,18 +946,22 @@ public final class RunHealthSession implements AutoCloseable {
      */
     static Double readMotorCurrentAmps(DcMotorEx motor) {
         if (motor == null) return null;
-        // Modern path: getCurrent(CurrentUnit.AMPS)
-        try {
-            Class<?> cu = Class.forName("com.qualcomm.robotcore.hardware.CurrentUnit");
-            Object amps = cu.getField("AMPS").get(null);
-            Object v = motor.getClass().getMethod("getCurrent", cu).invoke(motor, amps);
-            if (v instanceof Number) {
-                double d = ((Number) v).doubleValue();
-                return Double.isFinite(d) ? d : null;
+        // CurrentUnit lives in external.navigation in current FTC SDKs.
+        // Keep the older candidate for compatibility with vendor forks.
+        for (String className : new String[]{
+                "org.firstinspires.ftc.robotcore.external.navigation.CurrentUnit",
+                "com.qualcomm.robotcore.hardware.CurrentUnit"}) {
+            try {
+                Class<?> cu = Class.forName(className);
+                Object amps = cu.getField("AMPS").get(null);
+                Object v = motor.getClass().getMethod("getCurrent", cu).invoke(motor, amps);
+                if (v instanceof Number) {
+                    double d = ((Number) v).doubleValue();
+                    return Double.isFinite(d) ? d : null;
+                }
+            } catch (Throwable ignore) {
+                // Try the next SDK shape.
             }
-            return null;
-        } catch (Throwable ignore) {
-            // Fall through.
         }
         // Legacy path: getCurrent() no-args returning amps directly.
         try {

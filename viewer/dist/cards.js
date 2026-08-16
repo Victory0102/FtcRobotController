@@ -1,4 +1,4 @@
-import { formatPower, formatTicks, formatTps, formatAmps, formatVoltage, formatMs, formatHz, formatFractionPct, formatFractionPctSigned, formatSignedDiff, MISSING, } from './format.js';
+import { formatPower, formatTps, formatAmps, formatVoltage, formatMs, formatHz, formatFractionPct, formatFractionPctSigned, formatSignedDiff, MISSING, } from './format.js';
 import { getStatusClass, getStatusLabel } from './status.js';
 /* ============================================================ Live summary */
 function formatElapsed(ms) {
@@ -84,19 +84,40 @@ export function buildLiveSummaryChips(args) {
 }
 /* ============================================================ Motor cards */
 /**
- * Returns the FIRST finite entry of `arr` (the most-recent value when the
- * live store pushes to the FRONT of the history array).  Walks from index 0
- * upward and skips null/non-finite entries so a trailing bad value never
- * locks the card to stale data.
+ * Returns the most-recent finite entry of `arr`.
+ *
+ * LiveStore history arrays are stored in chronological order (oldest first),
+ * so the freshest valid value lives at the end of the array.  We walk
+ * backwards so a stale leading sample cannot pin the card to old data.
  */
-function firstFinite(arr) {
-    for (let i = 0; i < arr.length; i++) {
+function lastFinite(arr) {
+    for (let i = arr.length - 1; i >= 0; i--) {
         const e = arr[i];
         if (e.v != null && Number.isFinite(e.v)) {
             return { v: e.v, t: e.t };
         }
     }
     return null;
+}
+export function humanizeDeviceName(raw) {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0)
+        return 'Unnamed device';
+    const withSpaces = trimmed
+        .replace(/[_-]+/g, ' ')
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return withSpaces
+        .split(' ')
+        .map((part) => {
+        if (part.length === 0)
+            return part;
+        if (/^\d+$/.test(part))
+            return part;
+        return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+    })
+        .join(' ');
 }
 export function buildMotorCardDescriptors(args) {
     const out = [];
@@ -106,26 +127,23 @@ export function buildMotorCardDescriptors(args) {
         if (m && typeof m.device_name === 'string')
             snapByName.set(m.device_name, m);
     }
-    const names = args.store.getMotorNames();
+    const names = args.store.getMotorNames().slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
     for (const name of names) {
         const slice = args.store.getMotor(name);
         const live = slice;
         const snapMotor = snapByName.get(name);
-        // Live history convention: most-recent value is at INDEX 0 (push-to-front).
-        // Use firstFinite (not lastFinite) so the displayed value tracks the freshest sample.
-        const power = firstFinite(live?.powerHistory ?? []);
-        const position = firstFinite(live?.positionHistory ?? []);
-        const velocity = firstFinite(live?.velocityHistory ?? []);
-        const current = firstFinite(live?.currentHistory ?? []);
+        const power = lastFinite(live?.powerHistory ?? []);
+        const velocity = lastFinite(live?.velocityHistory ?? []);
+        const current = lastFinite(live?.currentHistory ?? []);
         const lastUpdateMs = power?.t ?? null;
         const rows = [
             { label: 'Power', value: formatPower(power?.v ?? snapMotor?.power), tone: power == null ? 'missing' : 'normal' },
-            { label: 'Position', value: formatTicks(position?.v ?? snapMotor?.position_ticks), tone: 'normal' },
             { label: 'Velocity', value: formatTps(velocity?.v ?? snapMotor?.velocity_ticks_per_second), tone: velocity == null ? 'missing' : 'normal' },
             { label: 'Current', value: formatAmps(current?.v ?? snapMotor?.current_amps), tone: current == null ? 'missing' : 'normal' },
         ];
         out.push({
             deviceName: name,
+            displayName: humanizeDeviceName(name),
             mode: live?.mode ?? snapMotor?.mode ?? '\u2014',
             metricRows: rows,
             lastUpdateMs,
@@ -217,7 +235,8 @@ export function buildCompareSummary(args) {
             statusClass: 'rh-status--missing' });
         chips.push({ kind: 'insufficient', label: 'Insufficient', value: String(insufficient),
             statusClass: 'rh-status--missing' });
-        cards = args.out.rows.map((r) => buildCompareCard(r));
+        cards = args.out.rows.map((r) => buildCompareCard(r))
+            .sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
     }
     else {
         // Return a "Comparison not loaded" indicator chip so the chips array
@@ -310,6 +329,7 @@ function buildCompareCard(r) {
     ];
     return {
         deviceName: r.deviceName,
+        displayName: humanizeDeviceName(r.deviceName),
         statusLabel: getStatusLabel(r.status),
         statusClass: getStatusClass(r.status),
         presence: r.presenceStatus,

@@ -88,6 +88,11 @@ public final class RunHealthApi {
                 return methodNotAllowed();
             }
             if (path.equals("/api/runs")) {
+                // The hub registers exact paths, so per-run operations use query parameters.
+                String id = req.queryParams.get("id");
+                if (id != null && !id.isEmpty()) {
+                    return routeRunById(method, id, req.queryParams.get("action"));
+                }
                 if ("GET".equals(method)) return listRuns(req);
                 return methodNotAllowed();
             }
@@ -100,7 +105,7 @@ public final class RunHealthApi {
                 return methodNotAllowed();
             }
 
-            // /api/runs/{id}/{action}
+            // Path-segment form kept for direct callers and JVM tests.
             Map<String, String> segs = splitRunSegments(path);
             if (segs == null) {
                 return notFound("Unknown path", path);
@@ -163,7 +168,7 @@ public final class RunHealthApi {
         try {
             byte[] data = new byte[(int) size];
             int off = 0;
-            try (java.io.InputStream in = java.nio.file.Files.newInputStream(comp.toPath())) {
+            try (java.io.InputStream in = new java.io.FileInputStream(comp)) {
                 while (off < data.length) {
                     int n = in.read(data, off, data.length - off);
                     if (n < 0) break;
@@ -191,6 +196,36 @@ public final class RunHealthApi {
         return out;
     }
 
+    /** Handles per-run actions passed as query parameters. */
+    private ApiResponse routeRunById(String method, String id, String action) {
+        if (action == null || action.isEmpty()) {
+            if ("GET".equals(method)) return getRun(id);
+            return methodNotAllowed();
+        }
+        if (action.equals("download")) {
+            if ("GET".equals(method)) return downloadRun(id);
+            return methodNotAllowed();
+        }
+        if (action.equals("delete")) {
+            if ("DELETE".equals(method) || "POST".equals(method)) return deleteRun(id);
+            return methodNotAllowed();
+        }
+        if (action.equals("manifest")) {
+            if ("GET".equals(method)) return downloadCompanion(id, ".manifest.json", "application/json; charset=utf-8");
+            return methodNotAllowed();
+        }
+        if (action.equals("channels")) {
+            if ("GET".equals(method)) return downloadCompanion(id, ".channels.csv", "text/csv; charset=utf-8");
+            return methodNotAllowed();
+        }
+        return notFound("Unknown run action", action);
+    }
+
+    /** Hub-friendly URL for a per-run operation. */
+    private static String runUrl(String runId, String action) {
+        return "/runhealth/api/runs?id=" + runId + "&action=" + action;
+    }
+
     // -------------------------------------------------------------- handlers
 
     private ApiResponse serveIndex() {
@@ -201,7 +236,7 @@ public final class RunHealthApi {
                 + "<title>FTC Run Health</title></head>"
                 + "<body><h1>FTC Run Health</h1>"
                 + "<p>The browser UI assets are not bundled. "
-                + "Use the JSON API at <a href=\"/api/runs\">/api/runs</a>.</p>"
+                + "Use the JSON API at <a href=\"/runhealth/api/runs\">/runhealth/api/runs</a>.</p>"
                 + "</body></html>";
         return ApiResponse.html(html);
     }
@@ -331,11 +366,11 @@ public final class RunHealthApi {
             if (isV2) sawV2 = true;
             row.put("schema_version", isV2 ? "2" : RunHealthCsv.SCHEMA_VERSION);
             row.put("schema_format", isV2 ? "v2_manifest_channels" : "v1_motor_csv");
-            row.put("url_download", "/api/runs/" + id + "/download");
-            row.put("url_delete", "/api/runs/" + id + "/delete");
+            row.put("url_download", runUrl(id, "download"));
+            row.put("url_delete", runUrl(id, "delete"));
             if (isV2) {
-                row.put("url_manifest", "/api/runs/" + id + "/manifest");
-                row.put("url_channels", "/api/runs/" + id + "/channels");
+                row.put("url_manifest", runUrl(id, "manifest"));
+                row.put("url_channels", runUrl(id, "channels"));
             }
             rows.add(row);
             totalBytes += f.length();
@@ -370,7 +405,7 @@ public final class RunHealthApi {
             }
             byte[] data = new byte[(int) size];
             int off = 0;
-            try (java.io.InputStream in = java.nio.file.Files.newInputStream(f.toPath())) {
+            try (java.io.InputStream in = new java.io.FileInputStream(f)) {
                 while (off < data.length) {
                     int n = in.read(data, off, data.length - off);
                     if (n < 0) break;
@@ -402,7 +437,7 @@ public final class RunHealthApi {
             }
             byte[] data = new byte[(int) size];
             int off = 0;
-            try (java.io.InputStream in = java.nio.file.Files.newInputStream(f.toPath())) {
+            try (java.io.InputStream in = new java.io.FileInputStream(f)) {
                 while (off < data.length) {
                     int n = in.read(data, off, data.length - off);
                     if (n < 0) break;
@@ -445,8 +480,7 @@ public final class RunHealthApi {
             RunHealthConfig.setBaselineRunId(null);
         }
         boolean ok = storage.deleteRun(runId);
-        // Unified deletion: also remove any companion files (manifest + channels)
-        // owned by the same logical run.
+        // Also remove any companion files (manifest + channels) for the run.
         boolean companionsOk = deleteCompanionFiles(stem);
         if (!ok) {
             return ApiResponse.jsonError(500, "Could not delete run", "delete_failed", stem);
@@ -488,10 +522,7 @@ public final class RunHealthApi {
                 }
                 if (storage.deleteRun(id)) {
                     deleted++;
-                    // Unified deletion: sweep companion files owned by this run.
-                    // Failure to delete a companion is not fatal; the main file
-                    // already went away, and we surface the result in the
-                    // companion_deletions map below.
+                    // Remove companion files owned by this run.
                     if (!deleteCompanionFiles(stem)) {
                         if (companionFailures == null) companionFailures = new ArrayList<>();
                         companionFailures.add(stem);
@@ -550,10 +581,10 @@ public final class RunHealthApi {
             String stem = stripCsv(f.getName());
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("run_id", stem);
-            entry.put("url_download", "/api/runs/" + stem + "/download");
+            entry.put("url_download", runUrl(stem, "download"));
             if (storage.findCompanionManifest(stem).isPresent()) {
-                entry.put("url_manifest", "/api/runs/" + stem + "/manifest");
-                entry.put("url_channels", "/api/runs/" + stem + "/channels");
+                entry.put("url_manifest", runUrl(stem, "manifest"));
+                entry.put("url_channels", runUrl(stem, "channels"));
             }
             urls.add(entry);
         }
@@ -568,15 +599,7 @@ public final class RunHealthApi {
         return ApiResponse.jsonObject(obj);
     }
 
-    /**
-     * Remove the companion files (manifest + channels) for a run whose
-     * main CSV has been deleted.  Returns true iff every existed companion
-     * has been removed.  Missing companions are not an error: a v1 run
-     * never produced companions.  Defence-in-depth path-traversal check
-     * via {@link FilenameSanitizer#isWithinDirectory(File, File)} so a
-     * weird stem cannot trick us into deleting an unrelated file in the
-     * runs directory.
-     */
+    /** Removes the manifest and channels companions for a run. */
     private boolean deleteCompanionFiles(String safeStem) {
         if (safeStem == null || safeStem.isEmpty()) return true;
         File dir = storage.runsDirectory();
@@ -687,6 +710,8 @@ public final class RunHealthApi {
 
         public static ApiResponse csv(byte[] data, boolean truncated) {
             Map<String, String> h = new LinkedHashMap<>();
+            h.put("Cache-Control", "no-store");
+            h.put("X-Content-Type-Options", "nosniff");
             h.put("X-Run-Health-Schema", RunHealthCsv.SCHEMA_VERSION);
             h.put("X-Run-Health-Truncated", truncated ? "1" : "0");
             return new ApiResponse(200, "text/csv; charset=utf-8", data, h);
@@ -695,6 +720,8 @@ public final class RunHealthApi {
         public static ApiResponse attachment(String filename, String contentType, byte[] data, boolean truncated) {
             Map<String, String> h = new LinkedHashMap<>();
             h.put("Content-Disposition", "attachment; filename=\"" + sanitizeHeader(filename) + "\"");
+            h.put("Cache-Control", "no-store");
+            h.put("X-Content-Type-Options", "nosniff");
             h.put("X-Run-Health-Schema", RunHealthCsv.SCHEMA_VERSION);
             h.put("X-Run-Health-Truncated", truncated ? "1" : "0");
             return new ApiResponse(200, contentType, data, h);

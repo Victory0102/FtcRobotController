@@ -12,18 +12,98 @@
  *   - All cross-run comparison numbers come from comparison.wholeRobotComparison
  *     and trends.* builders.  The renderer never re-derives a metric.
  */
-import { parseRunHealthCsv, detectDuplicates, } from './parser.js';
+import { parseUnifiedRun, parseChannelsCsv, parseManifestJson, detectDuplicates, } from './parser.js';
 import { wholeRobotComparison, perMotorTrend, } from './comparison.js';
-import { motorMetricSeries, defaultColor, seriesDomain, downsample, drawSeries, } from './graphs.js';
-import { drawField, poseSeriesToPath, DEFAULT_ZOOM_PAN, } from './field.js';
-import { globalReplayClock, lookupNumeric, lookupBoolean, lookupText, lookupPose, runDurationMs, PLAYBACK_SPEEDS, } from './replay.js';
+import { motorMetricSeries, seriesDomain, drawSeries, } from './graphs.js';
+import { globalReplayClock, lookupNumeric, lookupBoolean, lookupText, runDurationMs, PLAYBACK_SPEEDS, } from './replay.js';
 import { applyDeltas, customChannelTrend, } from './trends.js';
 import { LivePoller, LiveStore, liveSnapshotStats, safeText, LIVE_LIMITS, } from './live.js';
 import { getStatusClass, getStatusLabel } from './status.js';
 import { formatPower, formatTps, formatAmps, formatFractionPct, formatFractionPctSigned, formatSignedDiff, } from './format.js';
-import { buildCompareSummary, buildImportSummary, buildLiveSummaryChips, buildMotorCardDescriptors, buildConditionRows, } from './cards.js';
+import { buildCompareSummary, buildImportSummary, buildLiveSummaryChips, buildMotorCardDescriptors, buildConditionRows, humanizeDeviceName, } from './cards.js';
 import { analyzeLiveConditions, } from './observations.js';
+import { METRIC_HELP, getMetricHelp } from './metricHelp.js';
+import { buildTimeOverlay, buildWearHistory, compareMotorWear, } from './wear.js';
 const statePerKey = new WeakMap();
+const API_BASE = '/runhealth/api';
+// The Control Hub web server is resource constrained. One recording transfer
+// at a time is faster and more reliable than competing reads.
+const MAX_HYDRATION_WORKERS = 1;
+const RUN_FETCH_TIMEOUT_MS = 20000;
+const RUN_FETCH_ATTEMPTS = 2;
+function runApiUrl(runId, action) {
+    const query = new URLSearchParams({ id: runId });
+    if (action)
+        query.set('action', action);
+    return `${API_BASE}/runs?${query.toString()}`;
+}
+const autoSaveState = {
+    pendingNextRun: false,
+    everyMode: false,
+    lastRecordingMode: 'OFF',
+    inFlight: false,
+    lastSyncAtMs: 0,
+};
+const AUTO_SAVE_INTENT_KEY = 'runhealth.autoSaveIntent.v1';
+function rememberAutoSaveIntent(mode) {
+    autoSaveState.pendingNextRun = mode === 'NEXT';
+    autoSaveState.everyMode = mode === 'EVERY';
+    try {
+        if (mode === 'OFF')
+            localStorage.removeItem(AUTO_SAVE_INTENT_KEY);
+        else
+            localStorage.setItem(AUTO_SAVE_INTENT_KEY, mode);
+    }
+    catch { /* storage is optional */ }
+}
+function restoreAutoSaveIntent() {
+    try {
+        const mode = localStorage.getItem(AUTO_SAVE_INTENT_KEY);
+        if (mode === 'NEXT' || mode === 'EVERY')
+            rememberAutoSaveIntent(mode);
+    }
+    catch { /* storage is optional */ }
+}
+function setAutoSaveStatus(root, message) {
+    const el = root.querySelector('#rh-sync-status');
+    if (el)
+        el.textContent = message;
+}
+function setDownloadReadyStatus(root, message, hubRunId, filename) {
+    const el = root.querySelector('#rh-sync-status');
+    if (!el)
+        return;
+    el.textContent = `${message} `;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `Download ${filename} again`;
+    button.className = 'rh-download-fallback';
+    button.addEventListener('click', () => {
+        void downloadConnectedRun(`hub:${hubRunId}`, null).catch((error) => {
+            setAutoSaveStatus(root, `Download failed: ${error.message}`);
+        });
+    });
+    el.appendChild(button);
+}
+function recordingModeStatus(mode, connected) {
+    if (!connected) {
+        return 'Control Hub not connected yet. Save Next Run and Save Every Run will activate once the browser can reach the hub.';
+    }
+    if (autoSaveState.everyMode) {
+        return 'Save Every Run is armed. Completed runs will be saved to this computer automatically.';
+    }
+    if (autoSaveState.pendingNextRun) {
+        return mode === 'NEXT'
+            ? 'Save Next Run is armed. The next completed run will be saved to this computer automatically.'
+            : 'Save Next Run was armed and is waiting for that run to finish.';
+    }
+    switch (mode) {
+        case 'OFF':
+            return 'Recording is off.';
+        default:
+            return 'Recording mode is unknown.';
+    }
+}
 /* =========================================================== entry */
 document.addEventListener('DOMContentLoaded', () => {
     const root = document.getElementById('app');
@@ -33,14 +113,35 @@ document.addEventListener('DOMContentLoaded', () => {
         runs: new Map(),
         importedFiles: new Map(),
         replayByRun: new Map(),
+        connectedHub: false,
+        connectedRunIds: new Set(),
+        hubRunIdByRunId: new Map(),
+        hubRuns: new Map(),
+        connectedHubFileIds: new Set(),
+        hydratingHubRuns: new Set(),
+        hydrationErrors: new Map(),
+        hydrationInFlight: new Map(),
+        hydrationQueue: [],
+        hydrationWorkers: 0,
+        selectedReplayRunId: '',
+        replayConsumerDispose: null,
     };
     statePerKey.set(root, ctx);
+    restoreAutoSaveIntent();
     renderShell(root);
     attachHandlers(root);
+    updateStateAndRender(root);
     discoverControlHubApi().then((available) => {
-        if (available)
-            refreshConnectedRuns(root);
+        if (available) {
+            void refreshConnectedRuns(root);
+            void refreshRecordingControl(root);
+        }
     });
+    window.setInterval(() => {
+        if (autoSaveState.pendingNextRun || autoSaveState.everyMode) {
+            void syncCompletedRunsFromHub(root);
+        }
+    }, 1500);
 });
 /* =========================================================== tabs / shell */
 const TABS = [
@@ -49,23 +150,74 @@ const TABS = [
     { id: 'compare', label: 'Compare' },
     { id: 'replay', label: 'Replay' },
     { id: 'channels', label: 'Channels' },
-    { id: 'field', label: 'Field' },
     { id: 'trend', label: 'Trends' },
     { id: 'import', label: 'Import' },
 ];
 function renderShell(root) {
     const tabs = TABS.map((t, i) => `<button data-tab="${t.id}" class="rh-tab${i === 0 ? ' active' : ''}">${escapeHtml(t.label)}</button>`).join('');
     root.innerHTML = `
-    <header class="rh-header">
-      <h1>FTC Run Health</h1>
-      <p class="rh-tagline">Read-only robot observability, recording, replay, and diagnostics.</p>
-      <p class="rh-descriptor">Understand what changed. Inspect the evidence. Keep the robot under team control.</p>
-      <nav class="rh-tabs">${tabs}</nav>
-    </header>
-    <main>
-      <section data-section="saved">
+    <div class="rh-shell">
+      <aside class="rh-sidebar">
+        <div class="rh-brand">
+          <div class="rh-brand__eyebrow">FTC Run Health</div>
+          <h1>Mission Control</h1>
+          <p class="rh-tagline">Read-only robot observability, recording, replay, and diagnostics.</p>
+          <p class="rh-descriptor">Watch live motor health, save runs to this computer, and compare what changed.</p>
+        </div>
+        <div class="rh-sidebar__panel">
+          <div class="rh-sidebar__label">Workflow</div>
+          <p class="rh-sidebar__body">Connect to the Control Hub Wi-Fi, open the dashboard, arm recording, then run the OpMode.</p>
+        </div>
+        <nav class="rh-tabs rh-tabs--vertical" aria-label="Dashboard sections">${tabs}</nav>
+      </aside>
+      <main class="rh-main">
+        <section class="rh-hero">
+          <div class="rh-hero__copy">
+            <div class="rh-hero__eyebrow">Robot diagnostics</div>
+            <h2>See what the drivetrain is actually doing.</h2>
+            <p>Live graphs, saved runs, replay, compare, trends, and offline imports all stay in one place. Save Next Run or Save Every Run downloads each completed run to this computer automatically.</p>
+          </div>
+          <div class="rh-hero__highlights" aria-label="Highlights">
+            <div class="rh-hero__highlight">
+              <span class="rh-hero__highlight-label">Live</span>
+              <strong>Motor command, velocity, current, and response</strong>
+            </div>
+            <div class="rh-hero__highlight">
+              <span class="rh-hero__highlight-label">Save</span>
+              <strong>Downloads land on the laptop, not the robot</strong>
+            </div>
+            <div class="rh-hero__highlight">
+              <span class="rh-hero__highlight-label">Diagnose</span>
+              <strong>Replay, compare, trends, and custom channels</strong>
+            </div>
+          </div>
+        </section>
+        <details class="rh-learning-guide">
+          <summary>New to Run Health? Start here</summary>
+          <div class="rh-learning-guide__grid">
+            <div><strong>1. Command</strong><p>Commanded power is what your OpMode asks the motor to do, from -1 reverse to +1 forward.</p></div>
+            <div><strong>2. Response</strong><p>Encoder velocity is what the motor actually delivered. Current is the electrical effort used to produce that motion.</p></div>
+            <div><strong>3. Compare</strong><p>Use the same route, battery condition, payload, and motor mode. Choose the earlier run as Reference and the later run as Comparison.</p></div>
+            <div><strong>4. Interpret carefully</strong><p>Warnings identify measured differences, not confirmed failures. Inspect wiring, wheels, gears, bearings, battery, and test conditions before replacing parts.</p></div>
+          </div>
+          <p class="rh-learning-guide__note"><strong>Important:</strong> Unavailable data is not zero. Ticks/second depends on encoder and gearing, so compare a motor against its own earlier tests.</p>
+        </details>
+      <section data-section="live"></section>
+      <section data-section="saved" hidden>
+        <div class="rh-card">
+          <h2>Recording mode</h2>
+          <p class="rh-card__subtitle">Turn on Save Next Run or Save Every Run before an integrated OpMode to stream live data and save completed runs to this computer.</p>
+          <div id="rh-record-control" class="rh-record-control" role="group" aria-label="Recording mode">
+            <button type="button" data-rec="OFF" class="rh-rec-btn">Off</button>
+            <button type="button" data-rec="NEXT" class="rh-rec-btn">Save Next Run</button>
+            <button type="button" data-rec="EVERY" class="rh-rec-btn">Save Every Run</button>
+          </div>
+          <p id="rh-record-status" class="rh-record-status" role="status"></p>
+          <p id="rh-sync-status" class="rh-sync-status" role="status" aria-live="polite">Auto-save is idle.</p>
+        </div>
         <div class="rh-card">
           <h2>Saved Runs</h2>
+          <p class="rh-card__subtitle">A run becomes usable in every analysis tool after its motor samples are loaded. Hover or focus any <strong>?</strong> beside a column label for its meaning.</p>
           <div id="rh-saved-status"></div>
           <table id="rh-saved-table"></table>
         </div>
@@ -73,23 +225,20 @@ function renderShell(root) {
 
       <section data-section="compare" hidden>
         <div class="rh-card">
-          <h2>Whole-Robot Comparison</h2>
-          <p class="rh-card__subtitle">Select a baseline and another run to compare. Read the summary chips first, expand a motor for the detailed metric table.</p>
-          <label>Mode:
-            <select id="rh-mode">
-              <option value="BASELINE">Baseline</option>
-              <option value="DIRECT">Direct</option>
-            </select>
-          </label>
-          <label id="rh-baseline-row">Baseline:
+          <h2>Motor Wear Comparison</h2>
+          <p class="rh-card__subtitle">Compare the same test from two dates. The analysis matches commanded-power bands before reporting response changes, so different driving profiles are not mistaken for motor wear.</p>
+          <select id="rh-mode" hidden><option value="DIRECT" selected>Direct</option></select>
+          <label id="rh-baseline-row" hidden>Baseline:
             <select id="rh-baseline"></select>
           </label>
-          <label id="rh-reference-row" hidden>Reference:
+          <div class="rh-compare-picker">
+          <label id="rh-reference-row">Reference run (earlier):
             <select id="rh-reference"></select>
           </label>
-          <label id="rh-comparison-row" hidden>Comparison:
+          <label id="rh-comparison-row">Comparison run (later):
             <select id="rh-comparison"></select>
           </label>
+          </div>
           <div class="rh-meta">
             <label>Direction:
               <select id="rh-direction">
@@ -106,10 +255,13 @@ function renderShell(root) {
                 <option value="HIGH">High</option>
               </select>
             </label>
-            <label>Motor (graphs):
+            <label>Motor to diagnose:
               <select id="rh-graph-motor"></select>
             </label>
           </div>
+          <p class="rh-evidence-note">Diagnostic results are advisory and read-only. Confidence falls when command coverage, motor modes, battery state, or sample counts are not comparable.</p>
+          <details class="rh-section-help"><summary>How to read a comparison</summary><p><strong>Reference</strong> is the earlier known-good run. <strong>Comparison</strong> is the later run. Velocity shows delivered motion, current shows electrical effort, and command-to-motion response shows how much speed was delivered for similar power. Compare repeated tests, not unrelated driving sessions.</p></details>
+          <div id="rh-wear-report" class="rh-wear-report" aria-live="polite"></div>
           <div id="rh-compare-summary" class="rh-grid--summary" aria-live="polite"></div>
           <div id="rh-compare-cards" class="rh-compare-cards" aria-live="polite"></div>
           <details id="rh-compare-details-wrap">
@@ -117,9 +269,28 @@ function renderShell(root) {
             <p class="rh-card__subtitle">All 25 metrics per motor in one dense view. The collapsible cards above are usually easier to read.</p>
             <table id="rh-whole" class="rh-table"></table>
           </details>
-          <div class="rh-card-inner">
-            <h3>Motor graphs</h3>
-            <canvas id="rh-graph-canvas" class="rh-canvas"></canvas>
+          <h3>Overlay diagnostics</h3>
+          <div class="rh-diagnostic-graphs">
+            <figure class="rh-diagnostic-panel">
+              <figcaption><strong>Commanded power over run</strong><span>Y: commanded power (-1 to +1) · X: normalized run time (%)</span></figcaption>
+              <canvas id="rh-compare-power" width="1200" height="360" role="img" aria-label="Reference and comparison commanded power overlay"></canvas>
+              <div id="rh-diagnosis-power" class="rh-graph-diagnosis"></div>
+            </figure>
+            <figure class="rh-diagnostic-panel">
+              <figcaption><strong>Motor velocity over run</strong><span>Y: encoder velocity (ticks/second) · X: normalized run time (%)</span></figcaption>
+              <canvas id="rh-compare-velocity" width="1200" height="360" role="img" aria-label="Reference and comparison motor velocity overlay"></canvas>
+              <div id="rh-diagnosis-velocity" class="rh-graph-diagnosis"></div>
+            </figure>
+            <figure class="rh-diagnostic-panel">
+              <figcaption><strong>Motor current over run</strong><span>Y: current (amps) · X: normalized run time (%)</span></figcaption>
+              <canvas id="rh-compare-current" width="1200" height="360" role="img" aria-label="Reference and comparison motor current overlay"></canvas>
+              <div id="rh-diagnosis-current" class="rh-graph-diagnosis"></div>
+            </figure>
+            <figure class="rh-diagnostic-panel rh-diagnostic-panel--response">
+              <figcaption><strong>Commanded power to delivered velocity</strong><span>Y: median absolute velocity (ticks/second) · X: absolute commanded power</span></figcaption>
+              <canvas id="rh-compare-response" width="1200" height="360" role="img" aria-label="Reference and comparison power to velocity response overlay"></canvas>
+              <div id="rh-diagnosis-response" class="rh-graph-diagnosis"></div>
+            </figure>
           </div>
         </div>
       </section>
@@ -128,6 +299,7 @@ function renderShell(root) {
         <div class="rh-card">
           <h2>Replay</h2>
           <p class="rh-replay-banner-note" role="note">Replay displays recorded data only. It does not send commands to the robot.</p>
+          <p class="rh-card__subtitle">Move through one saved run in recorded time. The graph shows the most recent two-second window; the table reports custom-channel values at the current replay timestamp.</p>
           <label>Run:
             <select id="rh-replay-run"></select>
           </label>
@@ -143,10 +315,11 @@ function renderShell(root) {
             <span id="rh-replay-time" class="rh-replay-clock">0 / 0 ms</span>
           </div>
           <input id="rh-replay-scrubber" type="range" min="0" max="1000" value="0">
-          <div class="rh-card-inner">
-            <h3>Motor graphs at replay time</h3>
-            <canvas id="rh-replay-canvas" class="rh-canvas"></canvas>
-          </div>
+          <figure class="rh-explained-chart">
+            <figcaption><strong>Motor signals at replay time</strong><span>Horizontal axis: recorded time (ms) · Lines: power, velocity, current, and battery where available</span></figcaption>
+            <canvas id="rh-replay-canvas" class="rh-canvas" role="img" aria-label="Recorded motor signals over the latest two seconds of replay"></canvas>
+            <p>Use this view to align a visible event with changes in motor command and measured response. Because signals use different units, use the detailed values and Compare graphs for numerical conclusions.</p>
+          </figure>
           <h3>Live values</h3>
           <table id="rh-replay-values" class="rh-table"></table>
         </div>
@@ -155,6 +328,7 @@ function renderShell(root) {
       <section data-section="channels" hidden>
         <div class="rh-card">
           <h2>Custom Channels (selected run)</h2>
+          <p class="rh-card__subtitle">Custom channels are extra read-only values intentionally published by the OpMode. Their unit, group, and description come from the team’s channel registration.</p>
           <label>Run:
             <select id="rh-channels-run"></select>
           </label>
@@ -162,29 +336,22 @@ function renderShell(root) {
         </div>
       </section>
 
-      <section data-section="field" hidden>
-        <div class="rh-card">
-          <h2>Generic 12 ft × 12 ft Field View</h2>
-          <div class="rh-meta">
-            <button id="rh-field-reset">Reset</button>
-            <button id="rh-field-fit">Fit to content</button>
-            <button id="rh-field-zoomin">Zoom +</button>
-            <button id="rh-field-zoomout">Zoom −</button>
-          </div>
-          <div class="rh-field-square-wrap">
-            <canvas id="rh-field-canvas" class="rh-canvas rh-field-canvas"></canvas>
-          </div>
-        </div>
-      </section>
-
       <section data-section="trend" hidden>
         <div class="rh-card">
-          <h2>Trends</h2>
+          <h2>Motor Health History</h2>
+          <p class="rh-card__subtitle">Track one motor across repeated runs of the same OpMode. The first loaded run in the selected test becomes the historical reference.</p>
+          <details class="rh-section-help"><summary>How to build a useful trend</summary><p>Repeat the same test with the same motor mode, payload, surface, and similar battery state. A single change is a reason to inspect; a repeated direction across several runs is stronger evidence of drift.</p></details>
+          <label>Repeatable test / OpMode:
+            <select id="rh-trend-opmode"></select>
+          </label>
           <label>Motor:
             <select id="rh-trend-motor"></select>
           </label>
           <label>Series:
             <select id="rh-trend-series">
+              <option value="wearHealth">Motor evidence score</option>
+              <option value="responseVsFirst">Response change vs first run (%)</option>
+              <option value="currentVsFirst">Current change vs first run (%)</option>
               <option value="medianVelocity">Median velocity</option>
               <option value="velocityEfficiency">Velocity efficiency</option>
               <option value="currentCost">Current cost</option>
@@ -197,10 +364,12 @@ function renderShell(root) {
             </select>
           </label>
           <table id="rh-trend" class="rh-table"></table>
-          <div class="rh-card-inner">
-            <h3>Trend chart</h3>
-            <canvas id="rh-trend-canvas" class="rh-canvas"></canvas>
-          </div>
+          <figure class="rh-explained-chart">
+            <figcaption><strong id="rh-trend-chart-title">Trend chart</strong><span id="rh-trend-axis-label">Horizontal axis: run date · Vertical axis: selected metric</span></figcaption>
+            <canvas id="rh-trend-canvas" class="rh-canvas" role="img" aria-label="Selected motor health metric across recorded runs"></canvas>
+            <p id="rh-trend-metric-help">Choose a series to see what it measures.</p>
+          </figure>
+          <div id="rh-trend-diagnosis" class="rh-graph-diagnosis"></div>
         </div>
       </section>
 
@@ -230,7 +399,8 @@ function renderShell(root) {
           </p>
         </div>
       </section>
-    </main>
+      </main>
+    </div>
   `;
 }
 function attachHandlers(root) {
@@ -246,10 +416,20 @@ function attachHandlers(root) {
         if (!confirm('Clear imported recordings from this browser?'))
             return;
         const ctx = getCtx(root);
+        const importedIds = Array.from(ctx.importedFiles.keys());
+        for (const runId of importedIds) {
+            ctx.runs.delete(runId);
+            ctx.replayByRun.delete(runId);
+            if (ctx.selectedReplayRunId === runId)
+                ctx.selectedReplayRunId = '';
+            if (getBaselineId() === runId)
+                setBaselineId('');
+        }
         ctx.importedFiles.clear();
-        ctx.runs.clear();
-        localStorage.clear();
-        location.reload();
+        const list = root.querySelector('#rh-import-list');
+        if (list)
+            list.innerHTML = '';
+        updateStateAndRender(root);
     });
     // Import drag-and-drop area - real button + keyboard + drop wiring.
     const dnd = root.querySelector('#rh-import-dnd');
@@ -288,7 +468,7 @@ function attachHandlers(root) {
         attachReplayRun(root, last);
     });
     ['#rh-mode', '#rh-direction', '#rh-band', '#rh-baseline', '#rh-reference',
-        '#rh-comparison', '#rh-trend-motor', '#rh-trend-series', '#rh-graph-motor',
+        '#rh-comparison', '#rh-trend-opmode', '#rh-trend-motor', '#rh-trend-series', '#rh-graph-motor',
     ].forEach((sel) => {
         const el = root.querySelector(sel);
         if (el)
@@ -313,17 +493,37 @@ function attachHandlers(root) {
     });
     root.querySelector('#rh-replay-run')
         ?.addEventListener('change', (e) => attachReplayRun(root, e.target.value));
-    // Field view controls.
-    let fieldZp = { ...DEFAULT_ZOOM_PAN };
-    const redrawField = () => renderFieldView(root, fieldZp);
-    root.querySelector('#rh-field-reset')
-        ?.addEventListener('click', () => { fieldZp = { ...DEFAULT_ZOOM_PAN }; redrawField(); });
-    root.querySelector('#rh-field-fit')
-        ?.addEventListener('click', () => { fieldZp = { ...DEFAULT_ZOOM_PAN, fitToField: true }; redrawField(); });
-    root.querySelector('#rh-field-zoomin')
-        ?.addEventListener('click', () => { fieldZp.zoomX *= 1.25; fieldZp.zoomY *= 1.25; redrawField(); });
-    root.querySelector('#rh-field-zoomout')
-        ?.addEventListener('click', () => { fieldZp.zoomX /= 1.25; fieldZp.zoomY /= 1.25; redrawField(); });
+    root.querySelector('#rh-channels-run')
+        ?.addEventListener('change', () => renderChannelsSection(root));
+    // Recording-mode control (Saved Runs tab).
+    root.querySelectorAll('button[data-rec]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            const mode = btn.dataset.rec;
+            const previousIntent = autoSaveState.pendingNextRun ? 'NEXT'
+                : autoSaveState.everyMode ? 'EVERY' : 'OFF';
+            try {
+                if (mode !== 'OFF')
+                    await refreshConnectedRuns(root, false);
+                // Use POST because the hub's PUT body handling is unreliable here.
+                const r = await fetch(`${API_BASE}/recording`, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode }),
+                });
+                if (!r.ok)
+                    throw new Error('HTTP ' + r.status);
+                rememberAutoSaveIntent(mode);
+                await refreshRecordingControl(root);
+                if (mode !== 'OFF')
+                    void syncCompletedRunsFromHub(root);
+            }
+            catch (e) {
+                rememberAutoSaveIntent(previousIntent);
+                alert(`Could not change recording mode: ${e.message}`);
+            }
+        });
+    });
     // Drag-drop on body for offline replay / import.
     window.addEventListener('dragover', (e) => { e.preventDefault(); });
     window.addEventListener('drop', (e) => {
@@ -342,28 +542,109 @@ function sectionSwitch(root, which) {
 function getCtx(root) {
     let ctx = statePerKey.get(root);
     if (!ctx) {
-        ctx = { runs: new Map(), importedFiles: new Map(), replayByRun: new Map() };
+        ctx = {
+            runs: new Map(),
+            importedFiles: new Map(),
+            replayByRun: new Map(),
+            connectedHub: false,
+            connectedRunIds: new Set(),
+            hubRunIdByRunId: new Map(),
+            hubRuns: new Map(),
+            connectedHubFileIds: new Set(),
+            hydratingHubRuns: new Set(),
+            hydrationErrors: new Map(),
+            hydrationInFlight: new Map(),
+            hydrationQueue: [],
+            hydrationWorkers: 0,
+            selectedReplayRunId: '',
+            replayConsumerDispose: null,
+        };
         statePerKey.set(root, ctx);
     }
     return ctx;
 }
 function updateStateAndRender(root) {
+    void refreshRecordingControl(root);
     renderSavedSection(root);
     renderCompareSection(root);
     renderReplaySection(root);
     renderChannelsSection(root);
     renderTrendSection(root);
     renderImportSummary(root);
+    decorateMetricHelp(root);
     // The Live tab runs on its own bounded poller; calling here is safe
     // and idempotent — the poller checks isRunning() before scheduling.
     renderLiveSection(root);
+}
+/* =========================================================== Recording mode */
+const RECORD_LABELS = {
+    OFF: 'Off — nothing is recorded while an OpMode runs.',
+    NEXT: 'Save Next Run — armed; the claim is consumed on the first sample.',
+    EVERY: 'Save Every Run — every eligible integrated OpMode is recorded.',
+};
+let recordControlInFlight = false;
+/** Reads the persisted recording mode from the Control Hub. */
+async function refreshRecordingControl(root) {
+    if (recordControlInFlight)
+        return;
+    recordControlInFlight = true;
+    try {
+        const ctx = getCtx(root);
+        const status = root.querySelector('#rh-record-status');
+        const btns = root.querySelectorAll('button[data-rec]');
+        if (!status)
+            return;
+        const r = await fetch(`${API_BASE}/recording`, { credentials: 'include' });
+        if (!r.ok)
+            throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        const mode = typeof data.mode === 'string' ? data.mode : 'OFF';
+        ctx.connectedHub = true;
+        autoSaveState.lastRecordingMode = mode;
+        if (mode === 'NEXT') {
+            rememberAutoSaveIntent('NEXT');
+        }
+        else if (mode === 'EVERY') {
+            rememberAutoSaveIntent('EVERY');
+        }
+        else if (mode === 'OFF') {
+            // NEXT is consumed by the first sample, so the hub correctly reports
+            // OFF while the browser must keep waiting for that run to finish.
+            if (!autoSaveState.pendingNextRun)
+                autoSaveState.everyMode = false;
+        }
+        else {
+            autoSaveState.pendingNextRun = false;
+            autoSaveState.everyMode = false;
+        }
+        btns.forEach((b) => b.classList.toggle('active', b.dataset.rec === mode));
+        status.textContent = RECORD_LABELS[mode] ?? RECORD_LABELS.OFF;
+        status.dataset.mode = mode;
+        setAutoSaveStatus(root, recordingModeStatus(mode, true));
+    }
+    catch (e) {
+        const ctx = getCtx(root);
+        const status = root.querySelector('#rh-record-status');
+        root.querySelectorAll('button[data-rec]')
+            .forEach((b) => b.classList.remove('active'));
+        ctx.connectedHub = false;
+        if (status) {
+            delete status.dataset.mode;
+            status.textContent = 'Not connected to a Control Hub — recording is controlled from the hub web server.';
+        }
+        autoSaveState.lastRecordingMode = 'OFF';
+        setAutoSaveStatus(root, recordingModeStatus('OFF', false));
+    }
+    finally {
+        recordControlInFlight = false;
+    }
 }
 /* =========================================================== Saved Runs */
 function renderSavedSection(root) {
     const ctx = getCtx(root);
     const table = root.querySelector('#rh-saved-table');
     const status = root.querySelector('#rh-saved-status');
-    if (ctx.runs.size === 0 && ctx.importedFiles.size === 0) {
+    if (ctx.runs.size === 0 && ctx.importedFiles.size === 0 && ctx.hubRuns.size === 0) {
         status.textContent = 'No runs loaded. Drag CSVs onto this page or connect to a Control Hub.';
         table.innerHTML = '';
         return;
@@ -371,19 +652,29 @@ function renderSavedSection(root) {
     const baselineId = getBaselineId();
     const rows = [];
     for (const r of ctx.runs.values()) {
-        rows.push({ run: r, name: r.sourceFileName, imported: false, isBaseline: r.runId === baselineId });
+        const imported = ctx.importedFiles.get(r.runId);
+        rows.push({
+            run: r,
+            name: imported?.name ?? r.sourceFileName,
+            imported: imported != null,
+            isBaseline: r.runId === baselineId,
+        });
     }
-    for (const [runId, f] of ctx.importedFiles.entries()) {
-        const r = ctx.runs.get(runId);
-        if (!r)
-            continue;
-        rows.push({ run: r, name: f.name, imported: true, isBaseline: r.runId === baselineId });
-    }
-    status.textContent = `${rows.length} run(s). Click Open to enter the Replay panel.`;
+    rows.sort((a, b) => b.run.runStartedAt.localeCompare(a.run.runStartedAt));
+    const parsedHubIds = new Set(Array.from(ctx.hubRunIdByRunId.entries())
+        .filter(([runId]) => !runId.startsWith('hub:'))
+        .map(([, hubRunId]) => hubRunId));
+    const metadataOnly = Array.from(ctx.hubRuns.values())
+        .filter((meta) => !parsedHubIds.has(meta.hubRunId))
+        .sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
+    const analyzing = ctx.hydratingHubRuns.size;
+    const queuedCount = ctx.hydrationQueue.length;
+    status.textContent = `${ctx.hubRuns.size} hub recording(s); ${rows.length} ready in all analysis tools` +
+        `${analyzing > 0 ? `; ${analyzing} analyzing` : ''}${queuedCount > 0 ? `; ${queuedCount} queued` : ''}.`;
     table.innerHTML = `
     <thead>
       <tr>
-        <th>OpMode</th><th>Run ID</th><th>Started</th><th>Size</th>
+        <th>OpMode</th><th>Run ID</th><th>Started</th><th>Source</th><th>Size</th>
         <th>Motors</th><th>Channels</th><th>Samples</th><th>Build</th>
         <th>Truncated</th><th>Baseline</th><th>Actions</th>
       </tr>
@@ -397,8 +688,9 @@ function renderSavedSection(root) {
         const samples = row.run.samples.length;
         tr.innerHTML = `
       <td>${escapeHtml(row.run.opmodeName)}</td>
-      <td><code>${escapeHtml(row.run.runId.slice(0, 8))}</code></td>
+      <td><code>${escapeHtml(shortRunId(row.run.runId))}</code></td>
       <td>${escapeHtml(row.run.runStartedAt)}</td>
+      <td>${row.imported ? 'Imported' : 'Hub'}</td>
       <td>${row.run.samples.length > 0 ? '~' + Math.round(samples * 0.1) + ' KB' : '—'}</td>
       <td>${motors}</td>
       <td>${channelCount}</td>
@@ -407,10 +699,32 @@ function renderSavedSection(root) {
       <td>${row.run.truncated ? 'Yes' : 'No'}</td>
       <td>${row.isBaseline ? '✓' : ''}</td>
       <td>
-        <button data-act="open" data-id="${escapeHtml(row.run.runId)}">Open</button>
-        <button data-act="baseline" data-id="${escapeHtml(row.run.runId)}">Set Baseline</button>
-        <button data-act="delete" data-id="${escapeHtml(row.run.runId)}">Delete</button>
-        <button data-act="dl" data-id="${escapeHtml(row.run.runId)}">Download</button>
+        <button data-act="open" data-id="${escapeHtml(row.run.runId)}" data-imported="${row.imported ? '1' : '0'}">Open</button>
+        <button data-act="baseline" data-id="${escapeHtml(row.run.runId)}" data-imported="${row.imported ? '1' : '0'}">Set Baseline</button>
+        <button data-act="delete" data-id="${escapeHtml(row.run.runId)}" data-imported="${row.imported ? '1' : '0'}">Delete</button>
+        <button data-act="dl" data-id="${escapeHtml(row.run.runId)}" data-imported="${row.imported ? '1' : '0'}">Download</button>
+      </td>`;
+        tbody.appendChild(tr);
+    }
+    for (const meta of metadataOnly) {
+        const tr = document.createElement('tr');
+        const key = `hub:${meta.hubRunId}`;
+        const hydrating = ctx.hydratingHubRuns.has(meta.hubRunId);
+        const queued = ctx.hydrationQueue.includes(meta.hubRunId);
+        const hydrationError = ctx.hydrationErrors.get(meta.hubRunId);
+        tr.innerHTML = `
+      <td>${hydrating ? 'Analyzing…' : queued ? 'Queued for analysis' : hydrationError ? 'Analysis unavailable' : 'Ready to download'}</td>
+      <td><code>${escapeHtml(meta.hubRunId.slice(-12))}</code></td>
+      <td>${meta.lastModifiedMs > 0 ? escapeHtml(new Date(meta.lastModifiedMs).toLocaleString()) : '—'}</td>
+      <td>Hub</td>
+      <td>${escapeHtml(formatBytes(meta.sizeBytes))}</td>
+      <td>—</td><td>—</td><td>—</td><td>—</td>
+      <td>${meta.truncated ? 'Yes' : 'No'}</td><td></td>
+      <td>
+        <button data-act="analyze" data-id="${escapeHtml(key)}" data-imported="0"${hydrating ? ' disabled' : ''}>${hydrating ? 'Analyzing…' : queued ? 'Prioritize' : hydrationError ? 'Retry analysis' : 'Analyze now'}</button>
+        <button data-act="delete" data-id="${escapeHtml(key)}" data-imported="0">Delete</button>
+        <button data-act="dl" data-id="${escapeHtml(key)}" data-imported="0">Download</button>
+        ${hydrationError ? `<span class="rh-inline-error" role="alert">${escapeHtml(hydrationError)}</span>` : ''}
       </td>`;
         tbody.appendChild(tr);
     }
@@ -418,21 +732,24 @@ function renderSavedSection(root) {
         btn.addEventListener('click', () => {
             const id = btn.dataset.id;
             const act = btn.dataset.act;
+            const imported = btn.dataset.imported === '1';
             if (act === 'open') {
                 sectionSwitch(root, 'replay');
                 attachReplayRun(root, id);
             }
             else if (act === 'baseline') {
-                setBaselineId(id);
-                updateStateAndRender(root);
+                void apiSetBaseline(root, id, imported);
             }
             else if (act === 'delete') {
                 if (confirm('Delete this run and its companion files?')) {
-                    void apiDeleteRun(root, id);
+                    void apiDeleteRun(root, id, imported);
                 }
             }
             else if (act === 'dl') {
-                void apiDownloadRun(id);
+                void apiDownloadRun(root, id, imported);
+            }
+            else if (act === 'analyze') {
+                queueHubRunForHydration(root, id, true);
             }
         });
     });
@@ -441,6 +758,7 @@ function renderSavedSection(root) {
         const list = Array.from(duplicates.entries()).map(([k, n]) => `${k.slice(0, 8)}×${n}`).join(', ');
         status.textContent += ` Duplicate run_ids detected: ${list}.`;
     }
+    decorateMetricHelp(root);
 }
 function getBaselineId() {
     try {
@@ -513,13 +831,13 @@ function renderCompareCards(root) {
         const statusKlass = `rh-compare-card ${card.statusClass}`;
         const rowsHtml = card.expandedRows.map((r) => `
       <tr>
-        <td>${escapeHtml(r.metric)}</td>
+        <td>${metricHelpMarkup(r.metric)}</td>
         <td>${escapeHtml(r.reference)}</td>
         <td>${escapeHtml(r.comparison)}</td>
         <td>${escapeHtml(r.rawDifference)}</td>
         <td>${escapeHtml(r.percentDifference)}</td>
       </tr>`).join('');
-        return `<details class="${statusKlass}" data-compare-card="${escapeHtml(card.deviceName)}"><summary class="rh-compare-card__summary"><span class="rh-card--motor__name">${escapeHtml(card.deviceName)}</span><span class="rh-status ${card.statusClass}">${escapeHtml(card.statusLabel)}</span><span class="rh-compare-card__presence">${escapeHtml(card.presence)}</span><span class="rh-compare-card__samples">${escapeHtml(card.sampleConfidence)} samples</span></summary><div class="rh-compare-card__body"><table class="rh-table"><thead><tr><th>Metric</th><th>Reference</th><th>Comparison</th><th>Raw diff</th><th>Percent diff</th></tr></thead><tbody>${rowsHtml}</tbody></table></div></details>`;
+        return `<details class="${statusKlass}" data-compare-card="${escapeHtml(card.deviceName)}"><summary class="rh-compare-card__summary"><div class="rh-card--motor__identity"><span class="rh-card--motor__name">${escapeHtml(card.displayName)}</span><span class="rh-card--motor__tag">${escapeHtml(card.deviceName)}</span></div><span class="rh-status ${card.statusClass}">${escapeHtml(card.statusLabel)}</span><span class="rh-compare-card__presence">${escapeHtml(card.presence)}</span><span class="rh-compare-card__samples">${escapeHtml(card.sampleConfidence)} samples</span></summary><div class="rh-compare-card__body"><table class="rh-table"><thead><tr><th>Metric</th><th>Reference</th><th>Comparison</th><th>Raw diff</th><th>Percent diff</th></tr></thead><tbody>${rowsHtml}</tbody></table></div></details>`;
     }).join('');
 }
 function renderCompareSection(root) {
@@ -542,10 +860,19 @@ function renderCompareSection(root) {
     populateSelect(root.querySelector('#rh-reference'), ctx.runs);
     populateSelect(root.querySelector('#rh-comparison'), ctx.runs);
     populateSelect(root.querySelector('#rh-graph-motor'), ctx.runs, /* devicesOnly */ true);
+    const refSelect = root.querySelector('#rh-reference');
+    const cmpSelect = root.querySelector('#rh-comparison');
+    if (refSelect && cmpSelect && refSelect.value === cmpSelect.value && cmpSelect.options.length > 1) {
+        const baseline = getBaselineId();
+        refSelect.value = baseline && ctx.runs.has(baseline) ? baseline : refSelect.options[0].value;
+        cmpSelect.value = cmpSelect.options[cmpSelect.options.length - 1].value;
+        if (refSelect.value === cmpSelect.value)
+            refSelect.value = refSelect.options[0].value;
+    }
     renderCompareSummaryStrip(root);
     renderCompareCards(root);
     renderWholeTable(root);
-    renderMotorGraphCanvas(root);
+    renderWearAnalysis(root);
 }
 /**
  * Fill the rh-grid--summary strip above the comparison table with
@@ -659,12 +986,13 @@ function renderWholeTable(root) {
     for (const h of COMPARISON_HEADERS) {
         const th = document.createElement('th');
         th.textContent = h;
+        appendHelpDot(th, helpKeyForLabel(h));
         trh.appendChild(th);
     }
     const tbody = table.createTBody();
     for (const row of out.rows) {
         const tr = tbody.insertRow();
-        appendCell(tr, row.deviceName);
+        appendCell(tr, humanizeDeviceName(row.deviceName));
         appendCell(tr, `${getStatusLabel(row.status)} · ${row.presenceStatus}`, getStatusClass(row.status));
         appendCell(tr, formatTps(row.refMedianVelocity));
         appendCell(tr, formatTps(row.cmpMedianVelocity));
@@ -715,50 +1043,233 @@ function signalsShort(r) {
     const vc = r.hasVoltageCmp ? '\u2713' : '\u2014';
     return `I:${ar}/${ac} V:${vr}/${vc}`;
 }
-/* =========================================================== Graph canvas (Compare tab) */
-function renderMotorGraphCanvas(root) {
+/* =========================================================== Wear comparison */
+function renderWearAnalysis(root) {
     const ctx = getCtx(root);
-    const canvas = root.querySelector('#rh-graph-canvas');
+    const reportEl = root.querySelector('#rh-wear-report');
+    if (!reportEl)
+        return;
+    const refId = root.querySelector('#rh-reference')?.value ?? '';
+    const cmpId = root.querySelector('#rh-comparison')?.value ?? '';
+    const motor = root.querySelector('#rh-graph-motor')?.value ?? '';
+    const reference = ctx.runs.get(refId) ?? null;
+    const comparison = ctx.runs.get(cmpId) ?? null;
+    if (!reference || !comparison || !motor || reference.runId === comparison.runId) {
+        reportEl.innerHTML = '<p class="rh-empty">Load and select two different runs to begin a wear comparison.</p>';
+        clearComparisonCanvases(root, 'Select two different runs');
+        return;
+    }
+    const filter = {
+        direction: root.querySelector('#rh-direction')?.value ?? 'BOTH',
+        powerBand: root.querySelector('#rh-band')?.value ?? 'ALL_ACTIVE',
+    };
+    const report = compareMotorWear(reference, comparison, motor, filter);
+    const sharedMotors = reference.deviceNames.filter((name) => comparison.deviceNames.includes(name));
+    const fleetReports = sharedMotors
+        .map((name) => compareMotorWear(reference, comparison, name, filter))
+        .sort((a, b) => (a.healthScore ?? 1000) - (b.healthScore ?? 1000));
+    const fleetResponse = fleetReports
+        .map((item) => item.responseChangePct)
+        .filter((value) => value !== null);
+    const fleetMedianResponse = fleetResponse.length > 0 ? median(fleetResponse) : null;
+    let fleetContext = 'Not enough comparable motors to separate local and robot-wide changes.';
+    if (fleetMedianResponse !== null && report.responseChangePct !== null && fleetReports.length >= 2) {
+        if (report.responseChangePct < fleetMedianResponse - 10) {
+            fleetContext = 'This motor declined more than its peers, which points toward a local motor, gearbox, wheel, bearing, wiring, or encoder path.';
+        }
+        else if (fleetMedianResponse <= -8) {
+            fleetContext = 'Several motors changed in the same direction. Check battery state, payload, floor surface, and robot-wide drag before replacing one motor.';
+        }
+        else {
+            fleetContext = 'This motor is moving broadly with the robot-wide response pattern; no strong local outlier is visible.';
+        }
+    }
+    const overallSeverity = report.healthScore === null ? 'insufficient'
+        : report.healthScore < 60 ? 'warning'
+            : report.healthScore < 82 ? 'watch'
+                : 'healthy';
+    const priority = report.diagnoses
+        .filter((d) => d.severity === 'warning' || d.severity === 'watch')
+        .slice(0, 3);
+    reportEl.innerHTML = `
+    <div class="rh-wear-score rh-wear--${overallSeverity}">
+      <span class="rh-wear-score__label">Motor evidence score</span>
+      <strong>${report.healthScore === null ? 'Not enough data' : `${report.healthScore} / 100`}</strong>
+      <span>${escapeHtml(humanizeDeviceName(motor))}</span>
+    </div>
+    <div class="rh-wear-evidence">
+      <div><span>Confidence</span><strong class="rh-confidence rh-confidence--${report.confidence}">${escapeHtml(report.confidence)}</strong></div>
+      <div><span>Matched bands</span><strong>${report.matchedBins}</strong></div>
+      <div><span>Matched samples</span><strong>${report.matchedSamples}</strong></div>
+      <div><span>Response change</span><strong>${formatWearPct(report.responseChangePct)}</strong></div>
+      <div><span>Current change</span><strong>${formatWearPct(report.currentChangePct)}</strong></div>
+      <div><span>Battery difference</span><strong>${report.batteryDeltaV === null ? 'Unavailable' : `${report.batteryDeltaV >= 0 ? '+' : ''}${report.batteryDeltaV.toFixed(2)} V`}</strong></div>
+    </div>
+    <p class="rh-confidence-reason">${escapeHtml(report.confidenceReason)}</p>
+    ${report.modeMismatch ? '<p class="rh-evidence-alert">Motor modes differ. Treat performance conclusions as provisional until both tests use the same mode.</p>' : ''}
+    <div class="rh-priority-findings">
+      <h3>${priority.length > 0 ? 'Priority findings' : 'No material degradation detected'}</h3>
+      ${priority.length > 0
+        ? priority.map((d) => diagnosisHtml(d)).join('')
+        : '<p>Matched-command response is currently stable. Continue periodic tests under the same conditions to make future drift easier to detect.</p>'}
+    </div>
+    <div class="rh-fleet-context">
+      <h3>Robot-wide context</h3>
+      <p>${escapeHtml(fleetContext)}</p>
+      <div class="rh-fleet-ranking">${fleetReports.map((item) => `<button type="button" data-wear-motor="${escapeHtml(item.motor)}" class="${item.motor === motor ? 'active' : ''}"><span>${escapeHtml(humanizeDeviceName(item.motor))}</span><strong>${item.healthScore === null ? 'No score' : item.healthScore}</strong><small>${escapeHtml(item.confidence)} confidence</small></button>`).join('')}</div>
+    </div>`;
+    reportEl.querySelectorAll('button[data-wear-motor]').forEach((button) => {
+        button.addEventListener('click', () => {
+            const selector = root.querySelector('#rh-graph-motor');
+            if (!selector || !button.dataset.wearMotor)
+                return;
+            selector.value = button.dataset.wearMotor;
+            renderWearAnalysis(root);
+        });
+    });
+    drawComparisonOverlay(root.querySelector('#rh-compare-power'), buildTimeOverlay(reference, motor, 'power'), buildTimeOverlay(comparison, motor, 'power'), { xLabel: 'normalized run time (%)', yLabel: 'commanded power', xMin: 0, xMax: 100, yMin: -1, yMax: 1 });
+    drawComparisonOverlay(root.querySelector('#rh-compare-velocity'), buildTimeOverlay(reference, motor, 'velocity'), buildTimeOverlay(comparison, motor, 'velocity'), { xLabel: 'normalized run time (%)', yLabel: 'velocity (ticks/s)', xMin: 0, xMax: 100 });
+    drawComparisonOverlay(root.querySelector('#rh-compare-current'), buildTimeOverlay(reference, motor, 'current'), buildTimeOverlay(comparison, motor, 'current'), { xLabel: 'normalized run time (%)', yLabel: 'current (amps)', xMin: 0, xMax: 100, yMin: 0 });
+    drawComparisonOverlay(root.querySelector('#rh-compare-response'), report.referenceBins.map((b) => ({ x: b.power, y: b.medianVelocity })), report.comparisonBins.map((b) => ({ x: b.power, y: b.medianVelocity })), { xLabel: 'absolute commanded power', yLabel: 'median velocity (ticks/s)', xMin: 0.1, xMax: 1, yMin: 0, showMarkers: true });
+    for (const graph of ['power', 'velocity', 'current', 'response']) {
+        const el = root.querySelector(`#rh-diagnosis-${graph}`);
+        const item = report.diagnoses.find((d) => d.graph === graph);
+        if (el)
+            el.innerHTML = item ? diagnosisHtml(item) : '';
+    }
+}
+function diagnosisHtml(item) {
+    return `<article class="rh-diagnosis rh-wear--${item.severity}">
+    <div class="rh-diagnosis__head"><span>${escapeHtml(item.severity)}</span><strong>${escapeHtml(item.title)}</strong></div>
+    <p>${escapeHtml(item.finding)}</p>
+    <p><strong>What it might mean:</strong> ${escapeHtml(item.meaning)}</p>
+    <p><strong>Inspect next:</strong> ${escapeHtml(item.inspection)}</p>
+  </article>`;
+}
+function formatWearPct(value) {
+    return value === null ? 'Unavailable' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
+}
+function clearComparisonCanvases(root, message) {
+    for (const id of ['power', 'velocity', 'current', 'response']) {
+        drawComparisonOverlay(root.querySelector(`#rh-compare-${id}`), [], [], {
+            xLabel: '', yLabel: '', emptyMessage: message,
+        });
+        const diagnosis = root.querySelector(`#rh-diagnosis-${id}`);
+        if (diagnosis)
+            diagnosis.innerHTML = '';
+    }
+}
+function drawComparisonOverlay(canvas, reference, comparison, options) {
     if (!canvas)
         return;
-    const motorSel = root.querySelector('#rh-graph-motor');
-    if (!motorSel)
+    const ctx = canvas.getContext('2d');
+    if (!ctx)
         return;
-    const motor = motorSel.value;
-    const refSel = root.querySelector('#rh-baseline');
-    const cmpSel = root.querySelector('#rh-comparison');
-    const ref = refSel?.value ? ctx.runs.get(refSel.value) : null;
-    const cmp = cmpSel?.value ? ctx.runs.get(cmpSel.value) : null;
-    if (!motor || !ref)
-        return;
-    sizeCanvas(canvas);
-    const ctx2d = canvas.getContext('2d');
-    if (!ctx2d)
-        return;
-    ctx2d.save();
-    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
-    // Reference series for one motor.
-    const refSamp = ref.samples.filter((s) => s.deviceName === motor);
-    const cmpSamp = cmp?.samples.filter((s) => s.deviceName === motor) ?? [];
-    const series = motorMetricSeries(motor, refSamp, 0);
-    if (cmpSamp.length > 0) {
-        series.push(...motorMetricSeries(motor, cmpSamp, 1));
-    }
-    series.forEach((s) => { s.label = `${motor} – ${s.id.split('.').pop()}–${defaultColor(0)}`; });
-    const points = refSamp.length + (cmp?.samples.length ?? 0);
-    const targetPx = Math.max(80, points === 0 ? 80 : Math.round(800 * 3 / Math.max(2, points)));
-    for (const s of series) {
-        if (s.points.length > 1500)
-            s.points = downsample(s.points, Math.max(80, targetPx));
-    }
-    const dom = seriesDomain(series);
-    if (!dom) {
-        ctx2d.fillText('No data for selected motor', 8, 18);
-        ctx2d.restore();
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#0a1118';
+    ctx.fillRect(0, 0, width, height);
+    const plot = { left: 92, top: 48, right: width - 28, bottom: height - 64 };
+    const all = reference.concat(comparison).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (all.length === 0) {
+        ctx.fillStyle = '#93a4b8';
+        ctx.font = '18px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(options.emptyMessage ?? 'No samples available for this graph', width / 2, height / 2);
         return;
     }
-    drawSeries(ctx2d, series, dom, canvas.width - 20, canvas.height - 20, null);
-    ctx2d.restore();
+    let xMin = options.xMin ?? Math.min(...all.map((p) => p.x));
+    let xMax = options.xMax ?? Math.max(...all.map((p) => p.x));
+    let yMin = options.yMin ?? Math.min(...all.map((p) => p.y));
+    let yMax = options.yMax ?? Math.max(...all.map((p) => p.y));
+    if (xMin === xMax) {
+        xMin -= 1;
+        xMax += 1;
+    }
+    if (yMin === yMax) {
+        yMin -= 1;
+        yMax += 1;
+    }
+    if (options.yMin === undefined || options.yMax === undefined) {
+        const pad = Math.max((yMax - yMin) * 0.1, Math.abs(yMax) * 0.03, 0.1);
+        if (options.yMin === undefined)
+            yMin -= pad;
+        if (options.yMax === undefined)
+            yMax += pad;
+    }
+    const xOf = (x) => plot.left + ((x - xMin) / (xMax - xMin)) * (plot.right - plot.left);
+    const yOf = (y) => plot.bottom - ((y - yMin) / (yMax - yMin)) * (plot.bottom - plot.top);
+    ctx.font = '14px sans-serif';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 5; i += 1) {
+        const f = i / 5;
+        const x = plot.left + f * (plot.right - plot.left);
+        const y = plot.top + f * (plot.bottom - plot.top);
+        ctx.strokeStyle = 'rgba(147,164,184,.16)';
+        ctx.beginPath();
+        ctx.moveTo(x, plot.top);
+        ctx.lineTo(x, plot.bottom);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(plot.left, y);
+        ctx.lineTo(plot.right, y);
+        ctx.stroke();
+        ctx.fillStyle = '#93a4b8';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(formatGraphTick(xMin + f * (xMax - xMin)), x, plot.bottom + 10);
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(formatGraphTick(yMax - f * (yMax - yMin)), plot.left - 12, y);
+    }
+    ctx.fillStyle = '#b8c6d6';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(options.xLabel, (plot.left + plot.right) / 2, height - 8);
+    ctx.save();
+    ctx.translate(18, (plot.top + plot.bottom) / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText(options.yLabel, 0, 0);
+    ctx.restore();
+    const renderLine = (points, color, dashed) => {
+        if (points.length === 0)
+            return;
+        const step = Math.max(1, Math.ceil(points.length / 1200));
+        const visible = points.filter((_, index) => index % step === 0 || index === points.length - 1);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.setLineDash(dashed ? [10, 7] : []);
+        ctx.beginPath();
+        visible.forEach((point, index) => {
+            const x = xOf(point.x), y = yOf(point.y);
+            if (index === 0)
+                ctx.moveTo(x, y);
+            else
+                ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (options.showMarkers) {
+            ctx.fillStyle = color;
+            for (const point of visible) {
+                ctx.beginPath();
+                ctx.arc(xOf(point.x), yOf(point.y), 5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+    };
+    renderLine(reference, '#5eead4', false);
+    renderLine(comparison, '#fb923c', true);
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#5eead4';
+    ctx.fillRect(plot.left, 18, 28, 4);
+    ctx.fillText('Reference', plot.left + 38, 20);
+    ctx.fillStyle = '#fb923c';
+    ctx.fillRect(plot.left + 150, 18, 28, 4);
+    ctx.fillText('Comparison', plot.left + 188, 20);
 }
 /* =========================================================== Replay */
 function attachReplayRun(root, runId) {
@@ -768,6 +1279,7 @@ function attachReplayRun(root, runId) {
     const run = ctx.runs.get(runId);
     if (!run)
         return;
+    ctx.selectedReplayRunId = runId;
     // Build (or rebuild) the slice.
     const byChannelSamples = new Map();
     if (run.channels) {
@@ -785,12 +1297,31 @@ function renderReplaySection(root) {
     const sel = root.querySelector('#rh-replay-run');
     if (!sel)
         return;
+    const requestedRunId = ctx.selectedReplayRunId || sel.value;
     sel.innerHTML = '';
     for (const r of ctx.runs.values()) {
         const opt = document.createElement('option');
         opt.value = r.runId;
-        opt.textContent = `${r.runStartedAt} – ${r.opmodeName}`;
+        opt.textContent = `${r.runStartedAt} – ${r.opmodeName} – ${shortRunId(r.runId)}`;
         sel.appendChild(opt);
+    }
+    if (requestedRunId && ctx.runs.has(requestedRunId))
+        sel.value = requestedRunId;
+    const selectedRunId = sel.value;
+    if (selectedRunId && selectedRunId !== ctx.selectedReplayRunId) {
+        const run = ctx.runs.get(selectedRunId);
+        if (run) {
+            const byChannelSamples = new Map();
+            if (run.channels) {
+                for (const [name, list] of Object.entries(run.channels.byChannel)) {
+                    byChannelSamples.set(name, list.slice());
+                }
+            }
+            const endMs = runDurationMs(run.samples, run.durationMs ?? null);
+            ctx.replayByRun.set(selectedRunId, { run, byChannelSamples, endMs });
+            ctx.selectedReplayRunId = selectedRunId;
+            globalReplayClock.loadRun(0, endMs);
+        }
     }
     const scrub = root.querySelector('#rh-replay-scrubber');
     const time = root.querySelector('#rh-replay-time');
@@ -811,7 +1342,8 @@ function renderReplaySection(root) {
         renderReplayCanvas(root, t);
         renderReplayValues(root, t);
     };
-    globalReplayClock.registerConsumer(update);
+    ctx.replayConsumerDispose?.();
+    ctx.replayConsumerDispose = globalReplayClock.registerConsumer(update);
     // Initial fill.
     update(globalReplayClock.getTime());
 }
@@ -869,6 +1401,8 @@ function renderReplayValues(root, t) {
         if (list.length === 0)
             continue;
         const k = list[0].kind;
+        if (k === 'pose')
+            continue;
         let valueStr = '—';
         if (k === 'number') {
             const v = lookupNumeric(list, t);
@@ -882,19 +1416,13 @@ function renderReplayValues(root, t) {
             const v = lookupText(list, t);
             valueStr = v === null ? '—' : escapeHtml(v);
         }
-        else if (k === 'pose') {
-            const p = lookupPose(list, t);
-            valueStr = p === null
-                ? '—'
-                : `x=${p.x.toFixed(1)}in y=${p.y.toFixed(1)}in h=${(p.heading ?? 0).toFixed(2)}rad`;
-        }
         else if (k === 'event') {
             valueStr = list.length === 0 ? '—' : `${list.length} events`;
         }
         rows.push({ name, kind: k, value: valueStr });
     }
     table.innerHTML = `<thead><tr><th>Channel</th><th>Kind</th>
-    <th>Value at t = ${t | 0} ms</th></tr></thead><tbody></tbody>`;
+    <th>${metricHelpMarkup('Value at replay time')}<br><small>t = ${t | 0} ms</small></th></tr></thead><tbody></tbody>`;
     const tbody = table.querySelector('tbody');
     for (const row of rows) {
         const tr = tbody.insertRow();
@@ -909,13 +1437,16 @@ function renderChannelsSection(root) {
     const sel = root.querySelector('#rh-channels-run');
     if (!sel)
         return;
+    const previousRunId = sel.value;
     sel.innerHTML = '';
     for (const r of ctx.runs.values()) {
         const opt = document.createElement('option');
         opt.value = r.runId;
-        opt.textContent = `${r.runStartedAt} – ${r.opmodeName}`;
+        opt.textContent = `${r.runStartedAt} – ${r.opmodeName} – ${shortRunId(r.runId)}`;
         sel.appendChild(opt);
     }
+    if (previousRunId && ctx.runs.has(previousRunId))
+        sel.value = previousRunId;
     const cards = root.querySelector('#rh-channel-cards');
     if (!cards)
         return;
@@ -933,6 +1464,8 @@ function renderChannelsSection(root) {
     for (const channelName of run.channels.channelNames) {
         const chs = run.channels.byChannel[channelName];
         if (!chs)
+            continue;
+        if (chs[0]?.kind === 'pose')
             continue;
         const meta = run.manifest?.channels.find((m) => m.name === channelName);
         const div = document.createElement('div');
@@ -1010,17 +1543,6 @@ function renderChannelsSection(root) {
             }
             div.appendChild(ul);
         }
-        else if (chs[0]?.kind === 'pose') {
-            const last = lastPose(chs);
-            const ranges = poseSeriesToPath(chs);
-            const tbl = makeTable([
-                ['Samples', String(chs.length)],
-                ['Path points', String(ranges.length)],
-                ['X last', last === null ? '-' : last.x.toFixed(2)],
-                ['Y last', last === null ? '-' : last.y.toFixed(2)],
-            ]);
-            div.appendChild(tbl);
-        }
         else {
             const p = document.createElement('p');
             p.textContent = chs.length + ' event markers (visible in Replay timeline).';
@@ -1039,6 +1561,7 @@ function makeTable(rows) {
         const tr = document.createElement('tr');
         const td1 = document.createElement('td');
         td1.textContent = k;
+        appendHelpDot(td1, helpKeyForLabel(k));
         const td2 = document.createElement('td');
         td2.textContent = v;
         tr.appendChild(td1);
@@ -1071,16 +1594,6 @@ function lastText(chs) {
     }
     return null;
 }
-function lastPose(chs) {
-    for (let i = chs.length - 1; i >= 0; i--) {
-        const s = chs[i];
-        if (s && s.valueX !== null && s.valueX !== undefined
-            && s.valueY !== null && s.valueY !== undefined) {
-            return { x: s.valueX, y: s.valueY };
-        }
-    }
-    return null;
-}
 function median(v) {
     if (v.length === 0)
         return NaN;
@@ -1088,72 +1601,53 @@ function median(v) {
     const m = Math.floor(s.length / 2);
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
-/* =========================================================== Field */
-function renderFieldView(root, zp) {
-    const ctx = getCtx(root);
-    const canvas = root.querySelector('#rh-field-canvas');
-    if (!canvas)
-        return;
-    sizeCanvas(canvas);
-    const c = canvas.getContext('2d');
-    if (!c)
-        return;
-    // Build a travelled path from the first run with a pose channel.
-    let path = [];
-    let robot = null;
-    // If a replay is attached, use the replay clock + pose channel.
-    const replaySel = root.querySelector('#rh-replay-run');
-    const runId = replaySel?.value;
-    const slice = runId ? ctx.replayByRun.get(runId) : null;
-    if (slice) {
-        const t = globalReplayClock.getTime();
-        const poseCh = slice.byChannelSamples.get('robot.pose');
-        if (poseCh?.length) {
-            path = poseSeriesToPath(poseCh, 500).filter(Boolean).map((p) => ({ x: p.x, y: p.y, tMs: p.tMs }));
-            // Trailing only up to replay time.
-            path = path.filter((p) => (p.tMs ?? 0) <= t);
-            const p = lookupPose(poseCh, t);
-            if (p)
-                robot = { x: p.x, y: p.y, headingRad: p.heading ?? 0 };
-        }
-    }
-    else {
-        // Otherwise fall back to the first run that has a pose channel.
-        for (const r of ctx.runs.values()) {
-            const pose = r.channels?.byChannel['robot.pose'];
-            if (pose && pose.length > 0) {
-                path = poseSeriesToPath(pose, 500).filter(Boolean).map((p) => ({ x: p.x, y: p.y, tMs: p.tMs }));
-                const last = pose[pose.length - 1];
-                robot = { x: last.valueX ?? 0, y: last.valueY ?? 0, headingRad: last.valueHeading ?? 0 };
-                break;
-            }
-        }
-    }
-    drawField(c, canvas.width, canvas.height, { zp, path, robot });
-}
 /* =========================================================== Trend */
 function renderTrendSection(root) {
     const ctx = getCtx(root);
+    const opmodeSel = root.querySelector('#rh-trend-opmode');
     const motorSel = root.querySelector('#rh-trend-motor');
     const seriesSel = root.querySelector('#rh-trend-series');
     const table = root.querySelector('#rh-trend');
-    if (!motorSel || !seriesSel || !table)
+    if (!opmodeSel || !motorSel || !seriesSel || !table)
         return;
+    const previousOpmode = opmodeSel.value;
+    const previousMotor = motorSel.value;
+    const previousSeries = seriesSel.value;
+    opmodeSel.innerHTML = '';
+    const opmodes = Array.from(new Set(Array.from(ctx.runs.values()).map((run) => run.opmodeName))).sort();
+    for (const opmode of opmodes) {
+        const option = document.createElement('option');
+        option.value = opmode;
+        option.textContent = opmode;
+        opmodeSel.appendChild(option);
+    }
+    if (previousOpmode && opmodes.includes(previousOpmode))
+        opmodeSel.value = previousOpmode;
+    const selectedOpmode = opmodeSel.value;
+    const scopedRuns = Array.from(ctx.runs.values())
+        .filter((run) => run.opmodeName === selectedOpmode)
+        .sort((a, b) => a.runStartedAt.localeCompare(b.runStartedAt));
     motorSel.innerHTML = '';
     const allDevices = new Set();
-    for (const r of ctx.runs.values())
+    for (const r of scopedRuns)
         for (const d of r.deviceNames)
             allDevices.add(d);
-    for (const d of Array.from(allDevices).sort()) {
+    for (const d of Array.from(allDevices).sort((a, b) => humanizeDeviceName(a).localeCompare(humanizeDeviceName(b), undefined, { sensitivity: 'base' }))) {
         const opt = document.createElement('option');
         opt.value = d;
-        opt.textContent = d;
+        opt.textContent = humanizeDeviceName(d);
+        opt.title = d;
         motorSel.appendChild(opt);
     }
+    if (previousMotor && allDevices.has(previousMotor))
+        motorSel.value = previousMotor;
     // Build a Custom channels optgroup if any run defines numeric channels.
     // The optgroup is appended AFTER the canonical core-metric options.
     seriesSel.innerHTML = '';
     const CORE_OPTIONS = [
+        ['wearHealth', 'Motor evidence score'],
+        ['responseVsFirst', 'Response change vs first run (%)'],
+        ['currentVsFirst', 'Current change vs first run (%)'],
         ['medianVelocity', 'Median velocity'],
         ['velocityEfficiency', 'Velocity efficiency'],
         ['currentCost', 'Current cost'],
@@ -1172,7 +1666,7 @@ function renderTrendSection(root) {
     }
     // Add custom numeric channels gathered across all runs (deduplicated).
     const customNames = new Map();
-    for (const r of ctx.runs.values()) {
+    for (const r of scopedRuns) {
         const names = r.channels?.channelNames ?? [];
         for (const n of names) {
             if (!customNames.has(n))
@@ -1204,10 +1698,30 @@ function renderTrendSection(root) {
         seriesSel.onchange = onSeriesChange;
         onSeriesChange();
     }
+    if (previousSeries && Array.from(seriesSel.options).some((option) => option.value === previousSeries)) {
+        seriesSel.value = previousSeries;
+    }
+    motorSel.disabled = seriesSel.value.startsWith('custom:');
     const baselineId = getBaselineId();
     const motor = motorSel.value;
     const seriesKey = seriesSel.value;
-    const runs = Array.from(ctx.runs.values());
+    const selectedSeriesLabel = seriesSel.selectedOptions[0]?.textContent ?? 'Selected metric';
+    const trendHelpKey = helpKeyForTrend(seriesKey, selectedSeriesLabel);
+    const trendTitle = root.querySelector('#rh-trend-chart-title');
+    const trendAxis = root.querySelector('#rh-trend-axis-label');
+    const trendHelp = root.querySelector('#rh-trend-metric-help');
+    if (trendTitle)
+        trendTitle.textContent = `${selectedSeriesLabel} over time`;
+    if (trendAxis)
+        trendAxis.textContent = `Horizontal axis: run date · Vertical axis: ${selectedSeriesLabel}`;
+    if (trendHelp)
+        trendHelp.textContent = seriesKey.startsWith('custom:')
+            ? 'This is a team-defined numeric channel. Interpret it using the unit and description registered by the OpMode.'
+            : getMetricHelp(trendHelpKey);
+    const trendCanvas = root.querySelector('#rh-trend-canvas');
+    if (trendCanvas)
+        trendCanvas.setAttribute('aria-label', `${selectedSeriesLabel} across repeated ${selectedOpmode || 'OpMode'} runs`);
+    const runs = scopedRuns;
     const filter = { direction: 'BOTH', powerBand: 'ALL_ACTIVE' };
     const trend = buildTrendSeries(seriesKey, runs, motor, filter);
     const deltaed = applyDeltas(trend, { baselineRunId: baselineId || null });
@@ -1226,7 +1740,7 @@ function renderTrendSection(root) {
         appendCell(tr, p.insufficient || p.value === null ? 'gap' : 'ok');
     }
     // Draw the trend chart.
-    const canvas = root.querySelector('#rh-trend-canvas');
+    const canvas = trendCanvas;
     if (canvas && deltaed.length > 0) {
         sizeCanvas(canvas);
         const c = canvas.getContext('2d');
@@ -1244,6 +1758,20 @@ function renderTrendSection(root) {
             if (dom)
                 drawSeries(c, series, dom, canvas.width - 20, canvas.height - 20, null);
             c.restore();
+        }
+    }
+    const diagnosisEl = root.querySelector('#rh-trend-diagnosis');
+    if (diagnosisEl) {
+        const eligible = runs.filter((run) => run.deviceNames.includes(motor));
+        if (eligible.length < 2) {
+            diagnosisEl.innerHTML = '<p class="rh-empty">Load at least two recordings from this OpMode to calculate long-term drift.</p>';
+        }
+        else {
+            const report = compareMotorWear(eligible[0], eligible[eligible.length - 1], motor, filter);
+            const important = report.diagnoses.find((d) => d.severity === 'warning')
+                ?? report.diagnoses.find((d) => d.severity === 'watch')
+                ?? report.diagnoses.find((d) => d.graph === 'response');
+            diagnosisEl.innerHTML = `<div class="rh-history-summary"><strong>${eligible.length} runs tracked</strong><span>First: ${escapeHtml(eligible[0].runStartedAt)}</span><span>Latest: ${escapeHtml(eligible[eligible.length - 1].runStartedAt)}</span><span>Confidence: ${escapeHtml(report.confidence)}</span></div>${important ? diagnosisHtml(important) : ''}`;
         }
     }
 }
@@ -1277,6 +1805,28 @@ function buildTrendSeries(key, runs, motor, filter) {
         }));
     }
     switch (key) {
+        case 'wearHealth': {
+            const history = buildWearHistory(runs, motor, filter);
+            return history.map((point) => {
+                const run = runById.get(point.runId);
+                return { runId: point.runId, runStartedAt: point.runStartedAt,
+                    opmodeName: run?.opmodeName ?? '', buildIdentifier: run?.buildIdentifier ?? '',
+                    value: point.healthScore, baselineDelta: null, previousDelta: null,
+                    insufficient: point.healthScore === null || point.confidence === 'low' };
+            });
+        }
+        case 'responseVsFirst':
+        case 'currentVsFirst': {
+            const history = buildWearHistory(runs, motor, filter);
+            return history.map((point) => {
+                const run = runById.get(point.runId);
+                const value = key === 'responseVsFirst' ? point.responseChangePct : point.currentChangePct;
+                return { runId: point.runId, runStartedAt: point.runStartedAt,
+                    opmodeName: run?.opmodeName ?? '', buildIdentifier: run?.buildIdentifier ?? '',
+                    value, baselineDelta: null, previousDelta: null,
+                    insufficient: value === null || point.confidence === 'low' };
+            });
+        }
         case 'medianVelocity':
             return mapTrend((r) => r.medianVelocity);
         case 'velocityEfficiency':
@@ -1357,31 +1907,88 @@ function loopTimeHelper(runs, p) {
 function loopTimeMedianPoints(runs) { return loopTimeHelper(runs, 0.5); }
 function loopTimeP95Points(runs) { return loopTimeHelper(runs, 0.95); }
 /* =========================================================== Stage 10: Downloads */
-async function apiDownloadRun(runId) {
+async function apiDownloadRun(root, runId, imported = false) {
     try {
-        const url = `/api/runs/${encodeURIComponent(runId)}/download`;
-        const blob = await fetchAsBlob(url);
-        triggerDownload(blob, `${runId}.csv`);
+        const ctx = getCtx(root);
+        const run = ctx.runs.get(runId) ?? null;
+        if (imported || !ctx.connectedHub) {
+            if (run) {
+                downloadLocalRun(run);
+                return;
+            }
+            throw new Error('No local run data available for this browser download.');
+        }
+        await downloadConnectedRun(runId, run);
     }
     catch (e) {
         alert(`Failed to download ${runId}: ${e.message}`);
     }
 }
-async function apiDeleteRun(root, runId) {
+function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0)
+        return '—';
+    if (bytes < 1024)
+        return `${bytes} B`;
+    if (bytes < 1024 * 1024)
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+async function apiSetBaseline(root, runId, imported) {
     try {
-        const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}/delete`, { method: 'POST', credentials: 'include' });
-        if (!resp.ok)
-            throw new Error(`HTTP ${resp.status}`);
         const ctx = getCtx(root);
-        ctx.runs.delete(runId);
-        ctx.importedFiles.delete(runId);
-        ctx.replayByRun.delete(runId);
-        if (getBaselineId() === runId)
-            setBaselineId('');
+        if (!imported && ctx.connectedHub) {
+            const hubRunId = ctx.hubRunIdByRunId.get(runId) ?? runId;
+            const resp = await fetch(`${API_BASE}/baseline`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ run_id: hubRunId }),
+            });
+            if (!resp.ok)
+                throw new Error(`HTTP ${resp.status}`);
+        }
+        setBaselineId(runId);
         updateStateAndRender(root);
     }
     catch (e) {
+        alert(`Could not set baseline: ${e.message}`);
+    }
+}
+async function apiDeleteRun(root, runId, imported = false) {
+    try {
+        const ctx = getCtx(root);
+        if (imported || !ctx.connectedHub) {
+            deleteLocalRun(root, runId);
+            return;
+        }
+        const hubRunId = ctx.hubRunIdByRunId.get(runId) ?? runId;
+        const resp = await fetch(runApiUrl(hubRunId, 'delete'), { method: 'POST', credentials: 'include' });
+        if (!resp.ok)
+            throw new Error(`HTTP ${resp.status}`);
+        deleteLocalRun(root, runId);
+    }
+    catch (e) {
         alert(`Delete failed: ${e.message}`);
+    }
+}
+async function downloadConnectedRun(runId, run) {
+    const root = document.getElementById('app');
+    const ctx = root ? getCtx(root) : null;
+    const hubRunId = ctx?.hubRunIdByRunId.get(runId)
+        ?? (runId.startsWith('hub:') ? runId.slice(4) : runId);
+    const url = ctx?.hubRuns.get(hubRunId)?.downloadUrl ?? runApiUrl(hubRunId, 'download');
+    try {
+        const blob = await fetchAsBlob(url);
+        const filename = run?.sourceFileName
+            ?? (hubRunId ? ctx?.hubRuns.get(hubRunId)?.filename : null)
+            ?? `${hubRunId}.csv`;
+        triggerDownload(blob, filename);
+    }
+    catch (e) {
+        if (!run)
+            throw e;
+        downloadLocalRun(run);
+        return;
     }
 }
 async function fetchAsBlob(url) {
@@ -1390,11 +1997,81 @@ async function fetchAsBlob(url) {
         throw new Error(`HTTP ${r.status} for ${url}`);
     return await r.blob();
 }
+function downloadLocalRun(run) {
+    const csv = serializeRunCsv(run);
+    triggerDownload(new Blob([csv], { type: 'text/csv;charset=utf-8' }), run.sourceFileName || `${run.runId}.csv`);
+}
+function deleteLocalRun(root, runId) {
+    const ctx = getCtx(root);
+    const hubRunId = ctx.hubRunIdByRunId.get(runId);
+    if (hubRunId) {
+        ctx.hubRuns.delete(hubRunId);
+        ctx.connectedHubFileIds.delete(hubRunId);
+        ctx.hydratingHubRuns.delete(hubRunId);
+        ctx.hydrationErrors.delete(hubRunId);
+        ctx.hydrationInFlight.delete(hubRunId);
+        ctx.hydrationQueue = ctx.hydrationQueue.filter((id) => id !== hubRunId);
+    }
+    ctx.runs.delete(runId);
+    ctx.importedFiles.delete(runId);
+    ctx.replayByRun.delete(runId);
+    ctx.connectedRunIds.delete(runId);
+    ctx.hubRunIdByRunId.delete(runId);
+    if (getBaselineId() === runId)
+        setBaselineId('');
+    updateStateAndRender(root);
+}
+function escapeCsvCell(value) {
+    const text = value == null ? '' : String(value);
+    if (!/[",\r\n]/.test(text))
+        return text;
+    return `"${text.replace(/"/g, '""')}"`;
+}
+function serializeRunCsv(run) {
+    const lines = [];
+    lines.push([
+        'schema_version', 'run_id', 'opmode_name', 'run_started_at',
+        'timestamp_ms', 'device_name', 'commanded_power',
+        'encoder_position_ticks', 'encoder_velocity_ticks_per_second',
+        'current_amps', 'motor_mode', 'battery_voltage',
+    ].join(','));
+    for (const s of run.samples) {
+        lines.push([
+            1,
+            s.runId,
+            s.opmodeName,
+            s.runStartedAt,
+            s.timestampMs,
+            s.deviceName,
+            s.commandedPower,
+            s.encoderPositionTicks,
+            s.encoderVelocity,
+            s.currentAmps,
+            s.motorMode,
+            s.batteryVoltage,
+        ].map(escapeCsvCell).join(','));
+    }
+    if (run.truncated) {
+        const t = run.samples.length > 0 ? run.samples[run.samples.length - 1].timestampMs + 1 : 0;
+        lines.push([
+            1,
+            run.runId,
+            run.opmodeName,
+            run.runStartedAt,
+            t,
+            '__RUN_HEALTH_TRUNCATED__',
+            `TRUNCATED=${run.samples.length}`,
+            '',
+            '',
+            '',
+            '',
+            '',
+        ].map(escapeCsvCell).join(','));
+    }
+    return lines.join('\n') + '\n';
+}
 /* Stage 10 sequential-per-file download is wired via Saved Runs UI:
- * apiDownloadRun(runId) downloads one run's CSV blob.  Bulk
- * multi-select download is intentionally NOT exposed in this build
- * because the saved-runs tab has no per-row checkbox; the per-run
- * Download button is the visible UI action.  End-of-Stage-10 marker. */
+ * the per-run Download button now saves the CSV to the browser's download location. */
 function triggerDownload(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1415,37 +2092,95 @@ async function importFiles(files, root) {
     if (!files)
         return;
     const ctx = getCtx(root);
+    const bundles = new Map();
     for (let i = 0; i < files.length; i++) {
         const f = files.item(i);
         if (!f)
             continue;
         const text = await f.text();
-        // Try unified parser first; fall back to legacy v1 motor CSV.
-        let parsed;
-        if (f.name.endsWith('.csv') && !f.name.includes('.channels.csv') && !f.name.includes('.manifest.json')) {
-            parsed = parseRunHealthCsv(text, f.name);
+        const kind = classifyImportFile(f.name);
+        if (!kind) {
+            appendImportList(root, { name: f.name, size: f.size }, false, 'unsupported file type');
+            continue;
         }
-        else {
-            parsed = { kind: 'error', reason: 'unsupported', detail: f.name };
+        const stem = importStem(f.name, kind);
+        const bundle = bundles.get(stem) ?? {
+            displayName: f.name,
+            sizeBytes: 0,
+            motorCsv: null,
+            channelsCsv: null,
+            manifestJson: null,
+            sourceFileNames: {},
+        };
+        bundle.displayName = bundle.displayName || f.name;
+        bundle.sizeBytes += f.size;
+        if (kind === 'motor') {
+            bundle.motorCsv = text;
+            bundle.sourceFileNames.motor = f.name;
         }
+        else if (kind === 'channels') {
+            bundle.channelsCsv = text;
+            bundle.sourceFileNames.channels = f.name;
+        }
+        else if (kind === 'manifest') {
+            bundle.manifestJson = text;
+            bundle.sourceFileNames.manifest = f.name;
+        }
+        bundles.set(stem, bundle);
+    }
+    for (const bundle of bundles.values()) {
+        const parsed = parseUnifiedRun({
+            motorCsv: bundle.motorCsv,
+            channelsCsv: bundle.channelsCsv,
+            manifestJson: bundle.manifestJson,
+            sourceFileNames: bundle.sourceFileNames,
+        });
         if (parsed.kind === 'ok') {
-            ctx.runs.set(parsed.run.runId, parsed.run);
-            ctx.importedFiles.set(parsed.run.runId, { name: f.name, size: f.size, at: Date.now() });
+            const existing = ctx.runs.get(parsed.run.runId);
+            if (!existing) {
+                ctx.runs.set(parsed.run.runId, parsed.run);
+                ctx.importedFiles.set(parsed.run.runId, {
+                    name: bundle.displayName,
+                    size: bundle.sizeBytes,
+                    at: Date.now(),
+                });
+                appendImportList(root, { name: bundle.displayName, size: bundle.sizeBytes }, true, '');
+            }
+            else {
+                appendImportList(root, { name: bundle.displayName, size: bundle.sizeBytes }, true, `run ${shortRunId(parsed.run.runId)} was already available`);
+            }
         }
         else {
             // Surface a parse failure on the import list.
-            appendImportList(root, f, false, parsed.reason);
+            appendImportList(root, { name: bundle.displayName, size: bundle.sizeBytes }, false, `${parsed.reason}${parsed.detail ? `: ${parsed.detail}` : ''}`);
         }
     }
     updateStateAndRender(root);
     renderImportSummary(root);
+}
+function classifyImportFile(name) {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.channels.csv'))
+        return 'channels';
+    if (lower.endsWith('.manifest.json'))
+        return 'manifest';
+    if (lower.endsWith('.csv'))
+        return 'motor';
+    return null;
+}
+function importStem(name, kind) {
+    if (kind === 'channels')
+        return name.slice(0, -'.channels.csv'.length);
+    if (kind === 'manifest')
+        return name.slice(0, -'.manifest.json'.length);
+    return name.endsWith('.csv') ? name.slice(0, -4) : name;
 }
 function appendImportList(root, f, ok, err) {
     const list = root.querySelector('#rh-import-list');
     if (!list)
         return;
     const li = document.createElement('li');
-    li.textContent = `${f.name} (${(f.size / 1024).toFixed(1)} KB) — ${ok ? 'imported' : `rejected (${err})`}`;
+    li.textContent = `${f.name} (${(f.size / 1024).toFixed(1)} KB) — ${ok ? (err || 'imported and ready in all tools') : `rejected (${err})`}`;
     list.appendChild(li);
 }
 /**
@@ -1490,7 +2225,7 @@ function renderImportSummary(root) {
     if (openBtn) {
         openBtn.disabled = summary.openRunId == null;
         openBtn.textContent = summary.openRunId
-            ? `Open latest imported run (${summary.openRunId.slice(0, 8)})`
+            ? `Open latest imported run (${shortRunId(summary.openRunId)})`
             : 'Open latest imported run';
     }
 }
@@ -1498,37 +2233,299 @@ async function discoverControlHubApi() {
     if (typeof fetch === 'undefined')
         return false;
     try {
-        const r = await fetch('api/recording', { credentials: 'include' });
+        const r = await fetch(`${API_BASE}/recording`, { credentials: 'include' });
         return r.ok;
     }
     catch (e) {
         return false;
     }
 }
-async function refreshConnectedRuns(root) {
+async function refreshConnectedRuns(root, _hydrateRuns = false) {
     const status = root.querySelector('#rh-saved-status');
     try {
-        const resp = await fetch('api/runs', { credentials: 'include' });
+        const resp = await fetch(`${API_BASE}/runs`, { credentials: 'include' });
         if (!resp.ok)
             throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
         const ctx = getCtx(root);
-        ctx.runs = new Map();
+        const hubRuns = new Map();
         for (const r of data.runs ?? []) {
-            const csvResp = await fetch('api/runs/' + r.run_id, { credentials: 'include' });
-            if (!csvResp.ok)
+            const hubRunId = typeof r?.run_id === 'string' ? r.run_id : '';
+            if (!hubRunId)
                 continue;
-            const csvText = await csvResp.text();
-            const parsed = parseRunHealthCsv(csvText, r.filename ?? r.run_id + '.csv');
-            if (parsed.kind === 'ok') {
-                ctx.runs.set(parsed.run.runId, parsed.run);
-            }
+            hubRuns.set(hubRunId, {
+                hubRunId,
+                filename: typeof r?.filename === 'string' ? r.filename : `${hubRunId}.csv`,
+                sizeBytes: Number(r?.size_bytes) || 0,
+                lastModifiedMs: Number(r?.last_modified_ms) || 0,
+                truncated: r?.truncated === true,
+                schemaVersion: typeof r?.schema_version === 'string' ? r.schema_version : '1',
+                downloadUrl: typeof r?.url_download === 'string'
+                    ? r.url_download
+                    : runApiUrl(hubRunId, 'download'),
+                channelsUrl: typeof r?.url_channels === 'string' ? r.url_channels : null,
+                manifestUrl: typeof r?.url_manifest === 'string' ? r.url_manifest : null,
+            });
         }
-        status.textContent = `Connected: ${data.count ?? 0} runs found on the hub.`;
-        updateStateAndRender(root);
+        ctx.connectedHub = true;
+        ctx.hubRuns = hubRuns;
+        ctx.connectedHubFileIds = new Set(hubRuns.keys());
+        for (const hubRunId of hubRuns.keys()) {
+            ctx.hubRunIdByRunId.set(`hub:${hubRunId}`, hubRunId);
+        }
+        renderSavedSection(root);
+        queueAllHubRunsForHydration(root);
+        setAutoSaveStatus(root, recordingModeStatus(autoSaveState.lastRecordingMode, true));
     }
     catch (e) {
+        const ctx = getCtx(root);
+        ctx.connectedHub = false;
         status.textContent = `Control Hub API unavailable. Showing standalone (drag-and-drop) mode. Reason: ${e.message}`;
+        setAutoSaveStatus(root, recordingModeStatus('OFF', false));
+    }
+}
+function hubRunIsLoaded(ctx, hubRunId) {
+    for (const [runId, mappedHubId] of ctx.hubRunIdByRunId) {
+        if (runId !== `hub:${hubRunId}` && mappedHubId === hubRunId && ctx.runs.has(runId))
+            return true;
+    }
+    return false;
+}
+function queueAllHubRunsForHydration(root) {
+    const ctx = getCtx(root);
+    const newestFirst = Array.from(ctx.hubRuns.values())
+        .sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
+    for (const meta of newestFirst)
+        queueHubRunForHydration(root, `hub:${meta.hubRunId}`, false, false);
+    renderSavedSection(root);
+    pumpHydrationQueue(root);
+}
+function queueHubRunForHydration(root, runId, priority = false, startWorker = true) {
+    const ctx = getCtx(root);
+    const hubRunId = ctx.hubRunIdByRunId.get(runId)
+        ?? (runId.startsWith('hub:') ? runId.slice(4) : runId);
+    if (!ctx.hubRuns.has(hubRunId) || hubRunIsLoaded(ctx, hubRunId) || ctx.hydrationInFlight.has(hubRunId))
+        return;
+    const existingIndex = ctx.hydrationQueue.indexOf(hubRunId);
+    if (existingIndex >= 0)
+        ctx.hydrationQueue.splice(existingIndex, 1);
+    if (priority) {
+        ctx.hydrationErrors.delete(hubRunId);
+        ctx.hydrationQueue.unshift(hubRunId);
+    }
+    else if (!ctx.hydrationErrors.has(hubRunId)) {
+        ctx.hydrationQueue.push(hubRunId);
+    }
+    renderSavedSection(root);
+    if (startWorker)
+        pumpHydrationQueue(root);
+}
+function pumpHydrationQueue(root) {
+    const ctx = getCtx(root);
+    while (ctx.hydrationWorkers < MAX_HYDRATION_WORKERS && ctx.hydrationQueue.length > 0) {
+        const hubRunId = ctx.hydrationQueue.shift();
+        if (hubRunIsLoaded(ctx, hubRunId) || !ctx.hubRuns.has(hubRunId))
+            continue;
+        ctx.hydrationWorkers += 1;
+        void hydrateConnectedRun(root, `hub:${hubRunId}`, false).finally(() => {
+            const current = getCtx(root);
+            current.hydrationWorkers = Math.max(0, current.hydrationWorkers - 1);
+            renderSavedSection(root);
+            pumpHydrationQueue(root);
+        });
+    }
+}
+async function hydrateConnectedRun(root, runId, openWhenReady = false) {
+    const ctx = getCtx(root);
+    const hubRunId = ctx.hubRunIdByRunId.get(runId)
+        ?? (runId.startsWith('hub:') ? runId.slice(4) : runId);
+    const existingId = Array.from(ctx.hubRunIdByRunId.entries())
+        .find(([parsedId, hubId]) => parsedId !== `hub:${hubRunId}` && hubId === hubRunId)?.[0];
+    const existing = existingId ? ctx.runs.get(existingId) ?? null : null;
+    if (existing) {
+        if (openWhenReady) {
+            sectionSwitch(root, 'replay');
+            attachReplayRun(root, existing.runId);
+        }
+        return existing;
+    }
+    const inFlight = ctx.hydrationInFlight.get(hubRunId);
+    if (inFlight)
+        return inFlight;
+    const meta = ctx.hubRuns.get(hubRunId);
+    if (!meta)
+        return null;
+    const task = (async () => {
+        ctx.hydratingHubRuns.add(hubRunId);
+        ctx.hydrationErrors.delete(hubRunId);
+        renderSavedSection(root);
+        try {
+            const csvText = await fetchRunCsv(meta);
+            const companionText = Promise.all([
+                meta.channelsUrl ? fetchTextIfAvailable(meta.channelsUrl).catch(() => null) : Promise.resolve(null),
+                meta.manifestUrl ? fetchTextIfAvailable(meta.manifestUrl).catch(() => null) : Promise.resolve(null),
+            ]);
+            const parsed = parseUnifiedRun({
+                motorCsv: csvText,
+                sourceFileNames: {
+                    motor: meta.filename,
+                },
+            });
+            if (parsed.kind !== 'ok') {
+                throw new Error(`${parsed.reason}${parsed.detail ? `: ${parsed.detail}` : ''}`);
+            }
+            ctx.runs.set(parsed.run.runId, parsed.run);
+            ctx.connectedRunIds.add(parsed.run.runId);
+            ctx.hubRunIdByRunId.set(parsed.run.runId, hubRunId);
+            void companionText.then(([channelsText, manifestText]) => {
+                if (!channelsText && !manifestText)
+                    return;
+                const enrichedRun = { ...parsed.run };
+                if (channelsText) {
+                    const channels = parseChannelsCsv(channelsText);
+                    if (channels.kind === 'ok')
+                        enrichedRun.channels = channels.channels;
+                }
+                if (manifestText) {
+                    const manifest = parseManifestJson(manifestText);
+                    if (manifest.kind === 'ok' && manifest.manifest.runId === parsed.run.runId) {
+                        enrichedRun.manifest = manifest.manifest;
+                        enrichedRun.schemaVersion = manifest.manifest.schemaVersion || enrichedRun.schemaVersion;
+                        enrichedRun.buildIdentifier = manifest.manifest.buildIdentifier;
+                        enrichedRun.durationMs = manifest.manifest.durationMs;
+                        enrichedRun.configFingerprint = manifest.manifest.configFingerprint;
+                        enrichedRun.truncated = enrichedRun.truncated || manifest.manifest.truncated;
+                        enrichedRun.deviceNames = Array.from(new Set([
+                            ...enrichedRun.deviceNames,
+                            ...manifest.manifest.deviceNames,
+                        ])).sort();
+                    }
+                }
+                const current = getCtx(root);
+                current.runs.set(enrichedRun.runId, enrichedRun);
+                current.connectedRunIds.add(enrichedRun.runId);
+                current.hubRunIdByRunId.set(enrichedRun.runId, hubRunId);
+                updateStateAndRender(root);
+            });
+            if (openWhenReady) {
+                sectionSwitch(root, 'replay');
+                attachReplayRun(root, parsed.run.runId);
+            }
+            else {
+                updateStateAndRender(root);
+            }
+            return parsed.run;
+        }
+        catch (e) {
+            ctx.hydrationErrors.set(hubRunId, e.message);
+            return null;
+        }
+        finally {
+            ctx.hydratingHubRuns.delete(hubRunId);
+            ctx.hydrationInFlight.delete(hubRunId);
+            renderSavedSection(root);
+        }
+    })();
+    ctx.hydrationInFlight.set(hubRunId, task);
+    return task;
+}
+async function fetchRunCsv(meta) {
+    const urls = Array.from(new Set([runApiUrl(meta.hubRunId), meta.downloadUrl]));
+    let lastError = 'Recording could not be read.';
+    for (let attempt = 1; attempt <= RUN_FETCH_ATTEMPTS; attempt++) {
+        for (const url of urls) {
+            try {
+                const response = await fetchWithTimeout(url, RUN_FETCH_TIMEOUT_MS);
+                if (!response.ok) {
+                    const detail = (await response.text()).replace(/\s+/g, ' ').slice(0, 180);
+                    throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+                }
+                const text = await response.text();
+                if (!text.trim())
+                    throw new Error('Control Hub returned an empty recording.');
+                return text;
+            }
+            catch (error) {
+                lastError = error.name === 'AbortError'
+                    ? `Control Hub read timed out after ${RUN_FETCH_TIMEOUT_MS / 1000}s`
+                    : error.message;
+            }
+        }
+        if (attempt < RUN_FETCH_ATTEMPTS) {
+            await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+        }
+    }
+    throw new Error(`${lastError}. Download still works; press Retry analysis after confirming the Hub Wi-Fi connection.`);
+}
+async function fetchWithTimeout(url, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { credentials: 'include', signal: controller.signal });
+    }
+    finally {
+        clearTimeout(timeout);
+    }
+}
+async function fetchTextIfAvailable(url) {
+    const r = await fetchWithTimeout(url, RUN_FETCH_TIMEOUT_MS);
+    if (r.status === 404)
+        return null;
+    if (!r.ok)
+        throw new Error(`HTTP ${r.status} for ${url}`);
+    return await r.text();
+}
+async function syncCompletedRunsFromHub(root) {
+    const ctx = getCtx(root);
+    if (!ctx.connectedHub)
+        return;
+    if (!autoSaveState.pendingNextRun && !autoSaveState.everyMode) {
+        setAutoSaveStatus(root, recordingModeStatus(autoSaveState.lastRecordingMode, true));
+        return;
+    }
+    if (autoSaveState.inFlight)
+        return;
+    if (Date.now() - autoSaveState.lastSyncAtMs < 1000)
+        return;
+    autoSaveState.inFlight = true;
+    autoSaveState.lastSyncAtMs = Date.now();
+    try {
+        const previousIds = new Set(ctx.connectedHubFileIds);
+        const saveNextArmed = autoSaveState.pendingNextRun;
+        await refreshConnectedRuns(root, false);
+        const freshCtx = getCtx(root);
+        const newRuns = Array.from(freshCtx.hubRuns.values())
+            .filter((run) => !previousIds.has(run.hubRunId))
+            .sort((a, b) => a.lastModifiedMs - b.lastModifiedMs);
+        if (newRuns.length === 0) {
+            setAutoSaveStatus(root, autoSaveState.pendingNextRun
+                ? 'Save Next Run is armed. Waiting for the next completed run.'
+                : 'Save Every Run is armed. Waiting for the next completed run.');
+            return;
+        }
+        let savedCount = 0;
+        for (const run of newRuns) {
+            await downloadConnectedRun(`hub:${run.hubRunId}`, null);
+            queueHubRunForHydration(root, `hub:${run.hubRunId}`, true);
+            savedCount += 1;
+            if (saveNextArmed) {
+                rememberAutoSaveIntent('OFF');
+                autoSaveState.lastRecordingMode = 'OFF';
+                break;
+            }
+        }
+        if (savedCount === 1) {
+            setDownloadReadyStatus(root, `Download started: ${newRuns[0].filename}. Check this browser's Downloads list.`, newRuns[0].hubRunId, newRuns[0].filename);
+        }
+        else {
+            setAutoSaveStatus(root, `Saved ${savedCount} new runs to this computer.`);
+        }
+    }
+    catch (e) {
+        setAutoSaveStatus(root, `Auto-save could not sync: ${e.message}`);
+    }
+    finally {
+        autoSaveState.inFlight = false;
     }
 }
 /* =========================================================== helpers */
@@ -1563,10 +2560,11 @@ function populateSelect(sel, runs, devicesOnly = false) {
         for (const r of runs.values())
             for (const d of r.deviceNames)
                 devices.add(d);
-        for (const d of Array.from(devices).sort()) {
+        for (const d of Array.from(devices).sort((a, b) => humanizeDeviceName(a).localeCompare(humanizeDeviceName(b), undefined, { sensitivity: 'base' }))) {
             const opt = document.createElement('option');
             opt.value = d;
-            opt.textContent = d;
+            opt.textContent = humanizeDeviceName(d);
+            opt.title = d;
             sel.appendChild(opt);
         }
     }
@@ -1574,12 +2572,90 @@ function populateSelect(sel, runs, devicesOnly = false) {
         for (const r of runs.values()) {
             const opt = document.createElement('option');
             opt.value = r.runId;
-            opt.textContent = `${r.runStartedAt} – ${r.opmodeName} – ${r.runId.slice(0, 8)}`;
+            opt.textContent = `${r.runStartedAt} – ${r.opmodeName} – ${shortRunId(r.runId)}`;
             sel.appendChild(opt);
         }
     }
     if (previous && (runs.has(previous) || (devicesOnly && Array.from(sel.options).some((o) => o.value === previous)))) {
         sel.value = previous;
+    }
+}
+const HELP_KEY_ALIASES = {
+    'Vel Ref': 'Median velocity',
+    'Vel Cmp': 'Median velocity',
+    'Δ vel (raw)': 'Raw diff',
+    'Δ vel %': 'Percent diff',
+    'Eff Ref': 'Velocity efficiency',
+    'Eff Cmp': 'Velocity efficiency',
+    'Δ eff (raw)': 'Raw diff',
+    'Δ eff %': 'Percent diff',
+    'Cost Ref': 'Current cost',
+    'Cost Cmp': 'Current cost',
+    'Δ cost': 'Raw diff',
+    'Δ cost %': 'Percent diff',
+    'p95 Ref': '95th-percentile current',
+    'p95 Cmp': '95th-percentile current',
+    'Δ p95': 'Raw diff',
+    'Δ p95 %': 'Percent diff',
+    'Stall % Ref': 'Possible Stall Percentage',
+    'Stall % Cmp': 'Possible Stall Percentage',
+    'Δ stall %': 'Percent diff',
+    'Samples R/C': 'Samples',
+    'Current / Voltage': 'Current',
+    'Mode Warn': 'Status',
+    'Battery': 'Battery voltage',
+    'Update': 'Frequency',
+    'Raw difference': 'Raw diff',
+    'Percent difference': 'Percent diff',
+};
+function helpKeyForLabel(label) {
+    return HELP_KEY_ALIASES[label] ?? label;
+}
+function helpKeyForTrend(seriesKey, label) {
+    const byKey = {
+        wearHealth: 'Motor evidence score',
+        responseVsFirst: 'Response change',
+        currentVsFirst: 'Current change',
+        medianVelocity: 'Median velocity',
+        velocityEfficiency: 'Velocity efficiency',
+        currentCost: 'Current cost',
+        p95Current: '95th-percentile current',
+        possibleStallPct: 'Possible Stall Percentage',
+        batteryMin: 'Battery minimum',
+        batteryMedian: 'Battery median',
+        loopTimeMsMedian: 'Loop-time median',
+        loopTimeMsP95: 'Loop-time 95th percentile',
+    };
+    return byKey[seriesKey] ?? helpKeyForLabel(label);
+}
+function appendHelpDot(parent, key) {
+    const help = METRIC_HELP[key];
+    if (!help || parent.querySelector('.rh-help-dot'))
+        return;
+    const dot = document.createElement('span');
+    dot.className = 'rh-tooltip rh-help-dot';
+    dot.tabIndex = 0;
+    dot.textContent = '?';
+    dot.dataset.tip = help;
+    dot.title = help;
+    dot.setAttribute('role', 'note');
+    dot.setAttribute('aria-label', `${key}: ${help}`);
+    parent.appendChild(dot);
+}
+function metricHelpMarkup(label) {
+    const key = helpKeyForLabel(label);
+    const help = METRIC_HELP[key];
+    if (!help)
+        return escapeHtml(label);
+    return `${escapeHtml(label)} <span class="rh-tooltip rh-help-dot" tabindex="0" role="note" aria-label="${escapeHtml(`${key}: ${help}`)}" title="${escapeHtml(help)}" data-tip="${escapeHtml(help)}">?</span>`;
+}
+function decorateMetricHelp(root) {
+    const candidates = root.querySelectorAll('th, figcaption strong, .rh-metric__label, .rh-wear-score__label, .rh-wear-evidence span, .rh-meta-label');
+    for (const element of candidates) {
+        if (element.querySelector('.rh-help-dot'))
+            continue;
+        const label = (element.textContent ?? '').trim();
+        appendHelpDot(element, helpKeyForLabel(label));
     }
 }
 function sizeCanvas(canvas) {
@@ -1600,6 +2676,10 @@ function escapeHtml(s) {
             default: return '&#39;';
         }
     });
+}
+function shortRunId(runId) {
+    const text = String(runId);
+    return text.length <= 10 ? text : text.slice(-8);
 }
 /** CSS-safe identifier segment derived from a device name.  No HTML injection. */
 function cssIdSafe(s) {
@@ -1636,23 +2716,28 @@ function renderLiveSection(root) {
     if (!el) {
         el = document.createElement('section');
         el.setAttribute('data-section', 'live');
-        el.style.padding = '12px';
-        root.appendChild(el);
+        root.querySelector('.rh-main')?.appendChild(el);
     }
     liveState.containerEl = el;
     renderLiveDashboard(liveState);
     // Start polling (idempotent).
     if (!liveState.poller.isRunning()) {
         liveState.poller.start((snap) => {
+            const wasActive = liveState.lastSnap?.active === true;
+            const isActive = snap?.active === true;
             liveState.lastSnapshotAtMs = Date.now();
             liveState.lastSnap = snap;
-            liveState.connectionState = 'connected';
+            liveState.connectionState = isActive ? 'connected' : 'no_session';
             liveState.connectionStateAtMs = Date.now();
-            if (!liveState.paused) {
-                liveState.store.apply(snap);
-            }
-            if (liveState.containerEl)
+            // Pausing freezes painting, not collection, so resuming shows the
+            // complete diagnostic window instead of a hole in the graph.
+            liveState.store.apply(snap);
+            if (!liveState.paused && liveState.containerEl)
                 renderLiveDashboard(liveState);
+            if ((wasActive && !isActive) || (!isActive
+                && (autoSaveState.pendingNextRun || autoSaveState.everyMode))) {
+                void syncCompletedRunsFromHub(root);
+            }
         }, ({ reason, attempt }) => {
             liveState.connectionState = 'disconnected';
             liveState.connectionStateAtMs = Date.now();
@@ -1678,17 +2763,19 @@ function renderLiveDashboard(s) {
                 'Disconnected (will retry)';
     // Buttons (Pause/Resume/Clear)
     const btns = `
-    <div class="rh-live-toolbar" style="display:flex; gap:8px; margin-bottom:8px;">
+    <div class="rh-live-toolbar">
       <button data-live-action="pause">${s.paused ? 'Resume rendering' : 'Pause rendering'}</button>
       <button data-live-action="clear">Clear visible history</button>
     </div>
   `;
     // Channel cards table (legacy <table> for compatibility with existing CSS).
-    const channelNames = Array.from(s.store.channelHistoryByName.keys());
-    let channelTable = '<table class="rh-live-channels"><thead><tr><th>name</th><th>current</th><th>unit</th><th>group</th></tr></thead><tbody>';
+    const channelNames = s.store.getChannelNames();
+    let channelTable = '<table class="rh-live-channels"><thead><tr><th>Channel</th><th>Current value</th><th>Unit</th><th>Group</th></tr></thead><tbody>';
     for (const name of channelNames.slice(0, LIVE_LIMITS.MAX_CHANNEL_SERIES_PER_KIND)) {
         const slice = s.store.getChannel(name);
         if (!slice)
+            continue;
+        if (slice.kind === 'pose')
             continue;
         let current = '';
         if (slice.kind === 'number') {
@@ -1703,15 +2790,9 @@ function renderLiveDashboard(s) {
             const last = slice.textHistory[slice.textHistory.length - 1];
             current = last && last.text != null ? last.text : '—';
         }
-        else if (slice.kind === 'pose') {
-            const last = slice.poseHistory[slice.poseHistory.length - 1];
-            current = last ? `(${last.x?.toFixed(1)},${last.y?.toFixed(1)})` : '—';
-        }
         channelTable += `<tr><td>${escapeHtml(name)}</td><td>${escapeHtml(current)}</td><td>${escapeHtml(slice.unit ?? '')}</td><td>${escapeHtml(slice.group ?? '')}</td></tr>`;
     }
     channelTable += '</tbody></table>';
-    // Field canvas (reuses drawField via build-only — see renderLiveField).
-    const fieldCanvas = '<canvas data-live-field width="280" height="280" style="display:block; border:1px solid #ccc;"></canvas>';
     // Events list.
     const evs = s.store.getEvents().slice(-10);
     let evList = '<ol class="rh-live-events">';
@@ -1754,7 +2835,13 @@ function renderLiveDashboard(s) {
                 const tone = r.tone === 'missing' ? ' rh-metric--missing' : '';
                 return `<div class="rh-metric${tone}"><span class="rh-metric__label">${escapeHtml(r.label)}</span><span class="rh-metric__value">${escapeHtml(r.value)}</span></div>`;
             }).join('');
-            return `<article class="rh-card--motor" data-live-motor="${escapeHtml(mc.deviceName)}"><header class="rh-card--motor__head"><span class="rh-card--motor__name">${escapeHtml(mc.deviceName)}</span><span class="rh-card--motor__mode">${escapeHtml(mc.mode)}</span></header><div class="rh-card--motor__metrics">${rowsHtml}</div><div class="rh-card--motor__graphs"><figure class="rh-card--motor__graph"><figcaption class="rh-card--motor__graph-label">Power</figcaption><canvas id="${baseId}-power" width="240" height="60" data-live-metric="power" data-motor="${escapeHtml(mc.deviceName)}"></canvas></figure><figure class="rh-card--motor__graph"><figcaption class="rh-card--motor__graph-label">Velocity</figcaption><canvas id="${baseId}-velocity" width="240" height="60" data-live-metric="velocity" data-motor="${escapeHtml(mc.deviceName)}"></canvas></figure><figure class="rh-card--motor__graph"><figcaption class="rh-card--motor__graph-label">Current</figcaption><canvas id="${baseId}-current" width="240" height="60" data-live-metric="current" data-motor="${escapeHtml(mc.deviceName)}"></canvas></figure></div></article>`;
+            const graphDefs = [
+                { key: 'power', title: 'Commanded power', unit: 'normalized (-1 to +1)' },
+                { key: 'velocity', title: 'Encoder velocity', unit: 'ticks / second' },
+                { key: 'current', title: 'Motor current', unit: 'amps' },
+            ];
+            const graphsHtml = graphDefs.map((g) => `<figure class="rh-card--motor__graph"><figcaption class="rh-card--motor__graph-label"><strong>${escapeHtml(g.title)}</strong><span>${escapeHtml(g.unit)} · rolling 60 seconds</span></figcaption><canvas id="${baseId}-${g.key}" width="960" height="260" data-live-metric="${g.key}" data-motor="${escapeHtml(mc.deviceName)}" role="img" aria-label="${escapeHtml(mc.displayName)} ${escapeHtml(g.title)} live graph"></canvas></figure>`).join('');
+            return `<article class="rh-card--motor" data-live-motor="${escapeHtml(mc.deviceName)}" data-live-motor-label="${escapeHtml(mc.displayName)}"><header class="rh-card--motor__head"><div class="rh-card--motor__identity"><span class="rh-card--motor__name">${escapeHtml(mc.displayName)}</span><span class="rh-card--motor__tag">${escapeHtml(mc.deviceName)}</span></div><span class="rh-card--motor__mode">${escapeHtml(mc.mode)}</span></header><div class="rh-card--motor__metrics">${rowsHtml}</div><div class="rh-card--motor__graphs">${graphsHtml}</div></article>`;
         }).join('');
     const conditionsHtml = conditionRows.length === 0
         ? '<p class="rh-empty rh-empty--info">No advisories this window.</p>'
@@ -1762,14 +2849,13 @@ function renderLiveDashboard(s) {
     el.innerHTML = `
     <h2 class="rh-card__title">Live</h2>
     <p class="rh-card__subtitle">Read-only view of the currently active Run Health session. The browser cannot start or stop an OpMode.</p>
-    <div class="rh-card--motor" id="rh-live-conn-card" role="status" aria-live="polite"><div class="rh-card--motor__head"><span class="rh-card--motor__name"><span class="rh-live-dot" data-live-dot></span>${escapeHtml(connText)}</span><span class="rh-card--motor__mode">last update: ${escapeHtml(lastSeenAgo)} · observed ${stats.observedHz.toFixed(1)} Hz</span></div></div>
+    <details class="rh-section-help"><summary>How to read live motor data</summary><p><strong>Power</strong> is the command from robot code. <strong>Velocity</strong> is measured encoder response in ticks/second. <strong>Current</strong> is electrical effort in amps. A brief spike can be normal during acceleration; repeated high current with reduced velocity is more useful evidence of drag or load.</p></details>
+    <div class="rh-card--motor" id="rh-live-conn-card" role="status" aria-live="polite"><div class="rh-card--motor__head"><div class="rh-card--motor__identity"><span class="rh-card--motor__name"><span class="rh-live-dot" data-live-dot></span>${escapeHtml(connText)}</span><span class="rh-card--motor__tag">connection</span></div><span class="rh-card--motor__mode">last update: ${escapeHtml(lastSeenAgo)} · observed ${stats.observedHz.toFixed(1)} Hz</span></div></div>
     <div class="rh-live-strip" id="rh-live-strip">${chipsHtml}</div>
-    <div class="rh-live-toolbar">${btns}</div>
+    ${btns}
     <p data-live-rendering-note class="rh-card__subtitle">${s.paused ? 'Rendering paused — polling continues so reconnection state stays accurate. Pending history retained.' : 'Rendering updates every accepted snapshot; bounded 60s window.'}</p>
     <h3 class="rh-card__subtitle">Motors</h3>
     <div class="rh-grid--cards" id="rh-live-cards-grid">${motorCardsHtml}</div>
-    <h3 class="rh-card__subtitle">Pose path</h3>
-    ${fieldCanvas}
     <h3 class="rh-card__subtitle">Custom channels</h3>
     ${channelTable}
     <h3 class="rh-card__subtitle">Observed conditions</h3>
@@ -1777,6 +2863,7 @@ function renderLiveDashboard(s) {
     <h3 class="rh-card__subtitle">Recent events</h3>
     ${evList}
   `;
+    decorateMetricHelp(el);
     // Wire buttons.
     el.querySelectorAll('button[data-live-action]').forEach((btn) => {
         const a = btn.getAttribute('data-live-action');
@@ -1803,131 +2890,125 @@ function renderLiveDashboard(s) {
             return;
         const series = (metric === 'power') ? slice.powerHistory :
             (metric === 'velocity') ? slice.velocityHistory :
-                (metric === 'current') ? slice.currentHistory :
-                    slice.batteryHistory;
-        drawHudSparkline(canvas, series);
+                slice.currentHistory;
+        drawDiagnosticGraph(canvas, series, metric);
     });
-    // Render pose field canvas.
-    const fc = el.querySelector('canvas[data-live-field]');
-    if (fc)
-        drawLiveField(fc, s.store);
 }
-function drawHudSparkline(canvas, series) {
+function drawDiagnosticGraph(canvas, series, metric) {
     const w = canvas.width, h = canvas.height;
     const ctx = canvas.getContext('2d');
     if (!ctx)
         return;
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = '#fafafa';
+    ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, w, h);
-    if (series.length === 0)
+    const plot = { left: 72, top: 24, right: w - 20, bottom: h - 46 };
+    const values = series.filter((p) => p.v != null && Number.isFinite(p.v));
+    if (values.length === 0) {
+        ctx.fillStyle = '#8b949e';
+        ctx.font = '16px sans-serif';
+        ctx.fillText('Waiting for live samples', plot.left, h / 2);
         return;
+    }
     let lo = Number.POSITIVE_INFINITY, hi = Number.NEGATIVE_INFINITY;
-    for (const p of series) {
-        if (p.v == null)
-            continue;
+    for (const p of values) {
         if (p.v < lo)
             lo = p.v;
         if (p.v > hi)
             hi = p.v;
     }
-    if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) {
-        hi = lo + 1;
+    if (metric === 'power') {
+        lo = -1;
+        hi = 1;
     }
-    ctx.strokeStyle = '#444';
+    else {
+        const pad = Math.max((hi - lo) * 0.12, Math.abs(hi) * 0.04, 0.1);
+        lo -= pad;
+        hi += pad;
+    }
+    if (lo === hi) {
+        lo -= 1;
+        hi += 1;
+    }
+    const latestT = values[values.length - 1].t;
+    const earliestT = Math.max(values[0].t, latestT - LIVE_LIMITS.MAX_HISTORY_MS);
+    const span = Math.max(1000, latestT - earliestT);
+    const xOf = (t) => plot.left + ((t - earliestT) / span) * (plot.right - plot.left);
+    const yOf = (v) => plot.bottom - ((v - lo) / (hi - lo)) * (plot.bottom - plot.top);
+    ctx.font = '13px sans-serif';
     ctx.lineWidth = 1;
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i += 1) {
+        const frac = i / 4;
+        const y = plot.top + frac * (plot.bottom - plot.top);
+        const value = hi - frac * (hi - lo);
+        ctx.strokeStyle = 'rgba(139, 148, 158, 0.18)';
+        ctx.beginPath();
+        ctx.moveTo(plot.left, y);
+        ctx.lineTo(plot.right, y);
+        ctx.stroke();
+        ctx.fillStyle = '#9da7b3';
+        ctx.textAlign = 'right';
+        ctx.fillText(formatGraphTick(value), plot.left - 10, y);
+    }
+    for (let i = 0; i <= 4; i += 1) {
+        const frac = i / 4;
+        const x = plot.left + frac * (plot.right - plot.left);
+        ctx.strokeStyle = 'rgba(139, 148, 158, 0.12)';
+        ctx.beginPath();
+        ctx.moveTo(x, plot.top);
+        ctx.lineTo(x, plot.bottom);
+        ctx.stroke();
+        const secondsAgo = ((1 - frac) * span) / 1000;
+        ctx.fillStyle = '#9da7b3';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(secondsAgo < 0.5 ? 'now' : `-${secondsAgo.toFixed(0)}s`, x, plot.bottom + 10);
+    }
+    ctx.fillStyle = '#9da7b3';
+    ctx.textAlign = 'center';
+    ctx.fillText('time', (plot.left + plot.right) / 2, h - 10);
+    ctx.strokeStyle = metric === 'current' ? '#f2cc60'
+        : metric === 'velocity' ? '#58a6ff'
+            : '#3fb950';
+    ctx.lineWidth = 3;
+    ctx.lineJoin = 'round';
     ctx.beginPath();
     let first = true;
-    for (let i = 0; i < series.length; i++) {
-        const p = series[i];
-        if (p.v == null)
-            continue;
-        const x = (i / Math.max(1, series.length - 1)) * (w - 4) + 2;
-        const y = h - 4 - ((p.v - lo) / (hi - lo)) * (h - 8);
+    let previousT = null;
+    for (const p of values) {
+        const x = xOf(p.t);
+        const y = yOf(p.v);
+        if (previousT != null && p.t - previousT > 500)
+            first = true;
         if (first) {
             ctx.moveTo(x, y);
             first = false;
         }
         else
             ctx.lineTo(x, y);
+        previousT = p.t;
     }
     ctx.stroke();
-}
-function drawLiveField(canvas, store) {
-    // Lightweight field renderer: 12 ft × 12 ft field, 280x280 px, axes,
-    // 24-inch tile grid, bounded traveled path from the live pose channel.
-    const w = canvas.width, h = canvas.height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx)
-        return;
-    const inchesPerSide = 144; // 12 ft = 144 in
-    const pxPerIn = (w - 20) / inchesPerSide;
-    const cx = w / 2, cy = h / 2;
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = '#f4f4f0';
-    ctx.fillRect(0, 0, w, h);
-    ctx.strokeStyle = '#bbb';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(0, 0, w, h);
-    // Grid every 24 inches (2 ft).
-    ctx.strokeStyle = '#ddd';
-    ctx.lineWidth = 1;
-    for (let i = -72; i <= 72; i += 24) {
-        const px = cx + i * pxPerIn;
-        ctx.beginPath();
-        ctx.moveTo(px, 0);
-        ctx.lineTo(px, h);
-        ctx.stroke();
-        const py = cy - i * pxPerIn; // positive y is up
-        ctx.beginPath();
-        ctx.moveTo(0, py);
-        ctx.lineTo(w, py);
-        ctx.stroke();
-    }
-    // Axis labels.
-    ctx.fillStyle = '#666';
-    ctx.font = '11px sans-serif';
-    ctx.fillText('+X →', w - 28, cy - 6);
-    ctx.fillText('+Y ↑', cx + 6, 12);
-    ctx.fillText('0', cx - 4, cy + 12);
-    // Traveled path bounded to MAX_PATH_POINTS.
-    const path = store.getPrimaryPath();
-    ctx.strokeStyle = '#1976d2';
-    ctx.lineWidth = 2;
+    const last = values[values.length - 1];
+    ctx.fillStyle = ctx.strokeStyle;
     ctx.beginPath();
-    let started = false;
-    for (const p of path.slice(-LIVE_LIMITS.MAX_PATH_POINTS)) {
-        if (p.x == null || p.y == null)
-            continue;
-        const x = cx + p.x * pxPerIn;
-        const y = cy - p.y * pxPerIn;
-        if (!started) {
-            ctx.moveTo(x, y);
-            started = true;
-        }
-        else
-            ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-    // Current robot marker heading.
-    const last = store.lastPose();
-    if (last) {
-        const px = cx + last.x * pxPerIn;
-        const py = cy - last.y * pxPerIn;
-        ctx.fillStyle = '#d33';
-        ctx.beginPath();
-        ctx.arc(px, py, 5, 0, Math.PI * 2);
-        ctx.fill();
-        // Heading indicator (line 12in forward).
-        const hLen = 12 * pxPerIn;
-        const hx = px + Math.cos(last.heading) * hLen;
-        const hy = py - Math.sin(last.heading) * hLen;
-        ctx.strokeStyle = '#d33';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(px, py);
-        ctx.lineTo(hx, hy);
-        ctx.stroke();
-    }
+    ctx.arc(xOf(last.t), yOf(last.v), 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#e6edf3';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`LIVE ${formatGraphTick(last.v)}`, plot.right, 5);
+}
+function formatGraphTick(value) {
+    const abs = Math.abs(value);
+    if (abs >= 10000)
+        return value.toExponential(1);
+    if (abs >= 100)
+        return value.toFixed(0);
+    if (abs >= 10)
+        return value.toFixed(1);
+    return value.toFixed(2);
 }
 //# sourceMappingURL=main.js.map

@@ -41,7 +41,6 @@ export interface LiveLikeStore {
     deviceName: string;
     powerHistory: Array<{ t: number; v: number | null }>;
     velocityHistory: Array<{ t: number; v: number | null }>;
-    positionHistory?: Array<{ t: number; v: number | null }>;
     currentHistory?: Array<{ t: number; v: number | null }>;
     mode: string | null;
   } | undefined;

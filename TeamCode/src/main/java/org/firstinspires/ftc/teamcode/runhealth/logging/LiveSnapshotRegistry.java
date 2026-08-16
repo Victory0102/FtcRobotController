@@ -20,8 +20,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link #current()} are O(1) and lock-free (the {@code latest} field
  * is {@code volatile} and always assigned a fully-built immutable
  * instance, so a reader can never observe a half-constructed object).
- * Writes (publish/markInactive/clear) are {@code synchronized} on the
- * class object, sequence number is bumped via {@link AtomicLong}.
+     * Writes (publish/markInactive/clear) are {@code synchronized} on the
+     * instance, sequence number is tracked via {@link AtomicLong}.
  *
  * <p><strong>Bounded memory.</strong>  At most ONE {@link LiveSnapshot}
  * is reachable from this object between writes.  10,000 calls to
@@ -51,10 +51,13 @@ public final class LiveSnapshotRegistry {
      * assignment of a single reference to a {@code volatile} field is
      * atomic on the JVM memory model.  Sequence number is not modified
      * here; the supplied snapshot's {@link LiveSnapshot#sequence} field
-     * is the authoritative value.
+     * is copied into the registry counter. This keeps
+     * {@link #currentSequence()} synchronized with every publish so the
+     * next producer snapshot receives a strictly larger sequence.
      */
     public synchronized void publish(LiveSnapshot snap) {
         if (snap == null) return;
+        sequence.set(Math.max(sequence.get(), snap.sequence));
         this.latest = snap;
     }
 
@@ -106,6 +109,7 @@ public final class LiveSnapshotRegistry {
      */
     public synchronized void clear() {
         latest = null;
+        sequence.set(0L);
     }
 
     /**

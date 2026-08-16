@@ -229,7 +229,6 @@ export function makeSeries(id, label, points, index, visible = true) {
 export function motorMetricSeries(motorName, samples, index) {
     return [
         makeSeries(`${motorName}.power`, `${motorName} – power`, buildSampleSeries(samples, (s) => s.commandedPower), index),
-        makeSeries(`${motorName}.position`, `${motorName} – position`, buildSampleSeries(samples, (s) => s.encoderPositionTicks), index),
         makeSeries(`${motorName}.velocity`, `${motorName} – velocity`, buildSampleSeries(samples, (s) => s.encoderVelocity), index),
         makeSeries(`${motorName}.current`, `${motorName} – current`, buildSampleSeries(samples, (s) => s.currentAmps), index),
     ];

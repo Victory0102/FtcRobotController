@@ -18,7 +18,6 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -81,7 +80,7 @@ public final class RunStorage {
      * directory.  Hidden files and non-CSV files are skipped.
      */
     public List<File> listRuns() {
-        File[] files = runsDir.listFiles((f) -> f != null && f.isFile() && f.getName().endsWith(".csv"));
+        File[] files = runsDir.listFiles(RunStorage::isPrimaryRunFile);
         if (files == null) {
             return Collections.emptyList();
         }
@@ -91,6 +90,13 @@ public final class RunStorage {
             out.add(f);
         }
         return out;
+    }
+
+    static boolean isPrimaryRunFile(File file) {
+        return file != null
+                && file.isFile()
+                && file.getName().endsWith(".csv")
+                && !file.getName().endsWith(".channels.csv");
     }
 
     /**
@@ -232,7 +238,7 @@ public final class RunStorage {
         if (f == null) {
             throw new FileNotFound("Run not found: " + runId);
         }
-        try (InputStream in = Files.newInputStream(f.toPath())) {
+        try (InputStream in = new java.io.FileInputStream(f)) {
             byte[] buf = new byte[8192];
             long total = 0;
             int n;
