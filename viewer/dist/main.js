@@ -145,50 +145,57 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 /* =========================================================== tabs / shell */
 const TABS = [
-    { id: 'live', label: 'Live' },
-    { id: 'saved', label: 'Saved Runs' },
-    { id: 'compare', label: 'Compare' },
-    { id: 'replay', label: 'Replay' },
-    { id: 'channels', label: 'Channels' },
-    { id: 'trend', label: 'Trends' },
-    { id: 'import', label: 'Import' },
+    { id: 'live', label: 'Live monitor', group: 'Monitor' },
+    { id: 'saved', label: 'Saved runs', group: 'Monitor' },
+    { id: 'compare', label: 'Compare runs', group: 'Analyze' },
+    { id: 'replay', label: 'Run replay', group: 'Analyze' },
+    { id: 'trend', label: 'Health trends', group: 'Analyze' },
+    { id: 'channels', label: 'Channels', group: 'Data' },
+    { id: 'import', label: 'Import files', group: 'Data' },
 ];
 function renderShell(root) {
-    const tabs = TABS.map((t, i) => `<button data-tab="${t.id}" class="rh-tab${i === 0 ? ' active' : ''}">${escapeHtml(t.label)}</button>`).join('');
+    const groups = [...new Set(TABS.map((tab) => tab.group))];
+    const tabs = groups.map((group) => `
+    <div class="rh-nav-group">
+      <div class="rh-nav-group__label">${escapeHtml(group)}</div>
+      ${TABS.filter((tab) => tab.group === group).map((tab) => `<button data-tab="${tab.id}" class="rh-tab${tab.id === 'live' ? ' active' : ''}"><span>${escapeHtml(tab.label)}</span><span class="rh-tab__mark" aria-hidden="true"></span></button>`).join('')}
+    </div>
+  `).join('');
     root.innerHTML = `
     <div class="rh-shell">
       <aside class="rh-sidebar">
         <div class="rh-brand">
-          <div class="rh-brand__eyebrow">FTC Run Health</div>
-          <h1>Mission Control</h1>
-          <p class="rh-tagline">Read-only robot observability, recording, replay, and diagnostics.</p>
-          <p class="rh-descriptor">Watch live motor health, save runs to this computer, and compare what changed.</p>
-        </div>
-        <div class="rh-sidebar__panel">
-          <div class="rh-sidebar__label">Workflow</div>
-          <p class="rh-sidebar__body">Connect to the Control Hub Wi-Fi, open the dashboard, arm recording, then run the OpMode.</p>
+          <div class="rh-brand__symbol" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <div class="rh-brand__eyebrow">FTC diagnostics</div>
+            <h1>Run Health</h1>
+          </div>
         </div>
         <nav class="rh-tabs rh-tabs--vertical" aria-label="Dashboard sections">${tabs}</nav>
+        <div class="rh-sidebar__panel">
+          <div class="rh-sidebar__label"><span class="rh-safe-dot"></span> Read-only system</div>
+          <p class="rh-sidebar__body">Observes robot data. It cannot send motor commands or change your controls.</p>
+        </div>
       </aside>
       <main class="rh-main">
         <section class="rh-hero">
           <div class="rh-hero__copy">
             <div class="rh-hero__eyebrow">Robot diagnostics</div>
-            <h2>See what the drivetrain is actually doing.</h2>
-            <p>Live graphs, saved runs, replay, compare, trends, and offline imports all stay in one place. Save Next Run or Save Every Run downloads each completed run to this computer automatically.</p>
+            <h2>Motor insights</h2>
+            <p>Measure what the drivetrain is doing, compare repeatable runs, and spot changes before they become failures.</p>
           </div>
           <div class="rh-hero__highlights" aria-label="Highlights">
             <div class="rh-hero__highlight">
-              <span class="rh-hero__highlight-label">Live</span>
-              <strong>Motor command, velocity, current, and response</strong>
+              <span class="rh-hero__highlight-label">Signals</span>
+              <strong>Power · velocity · current</strong>
             </div>
             <div class="rh-hero__highlight">
-              <span class="rh-hero__highlight-label">Save</span>
-              <strong>Downloads land on the laptop, not the robot</strong>
+              <span class="rh-hero__highlight-label">Storage</span>
+              <strong>Runs save to this computer</strong>
             </div>
             <div class="rh-hero__highlight">
-              <span class="rh-hero__highlight-label">Diagnose</span>
-              <strong>Replay, compare, trends, and custom channels</strong>
+              <span class="rh-hero__highlight-label">Safety</span>
+              <strong>Observe only · never controls</strong>
             </div>
           </div>
         </section>
